@@ -225,8 +225,10 @@ jobs:
           mkdir -p "$dist"
           zstd -T0 -10 -o "$dist/buntos.root-arm64.raw.zst" "$src/buntos.root-arm64.raw"
           for f in "$src"/buntos.vmlinuz "$src"/buntos.initrd "$src"/buntos.manifest; do
-            [[ -f "$f" ]] && cp "$f" "$dist/"
+            if [[ -f "$f" ]]; then cp "$f" "$dist/"; fi
           done
+          # LK 부트 이미지(boot/mkimages.sh)는 이미지에 든 것과 같은 커널 꾸러미로 만들어야 모듈이 맞는다
+          cp "$BUNTOS_BUILD_DIR"/tb375fc/deb/linux-image-*.deb "$dist/"
           (cd "$dist" && sha256sum * >SHA256SUMS && cat SHA256SUMS)
           sha256sum "$src/buntos.root-arm64.raw" | tee -a "$GITHUB_STEP_SUMMARY"
           echo "DIST=$dist" >>"$GITHUB_ENV"
