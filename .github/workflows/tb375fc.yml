@@ -51,10 +51,14 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q flex bison bc libssl-dev libelf-dev dwarves cpio kmod lz4 device-tree-compiler \
-            debhelper libdw-dev rsync zstd debian-archive-keyring gpgv
-          # debian-config.sh는 새 sqv(--signature-file)와 debian-archive-keyring.pgp를 쓴다. Ubuntu 24.04의 sqv는 옛 문법이라
-          # 같은 검사를 gpgv로 한다
-          sudo ln -sf debian-archive-keyring.gpg /usr/share/keyrings/debian-archive-keyring.pgp
+            debhelper libdw-dev rsync zstd gpgv
+          # debian-config.sh는 debian-archive-keyring.pgp와 새 sqv(--signature-file)를 쓴다. Ubuntu 24.04의 열쇠 묶음
+          # (2023.4)은 forky 스냅숏의 서명 열쇠를 모르므로 Debian의 2025.1을 받아 꺼내고, 옛 문법인 sqv 대신 gpgv로 검사한다
+          keyring_deb=debian-archive-keyring_2025.1_all.deb
+          curl -fsSL -o "$RUNNER_TEMP/$keyring_deb" "https://deb.debian.org/debian/pool/main/d/debian-archive-keyring/$keyring_deb"
+          echo "9ea7778e443144ca490668737a8ab22dd3e748bb99e805e22ec055abeb3c7fac  $RUNNER_TEMP/$keyring_deb" | sha256sum -c
+          dpkg-deb -x "$RUNNER_TEMP/$keyring_deb" "$RUNNER_TEMP/keyring"
+          sudo install -m 0644 "$RUNNER_TEMP/keyring/usr/share/keyrings/debian-archive-keyring.pgp" /usr/share/keyrings/
           printf '%s\n' '#!/bin/bash' 'set -e; kr= sig= file=' \
             'while [ $# -gt 0 ]; do case "$1" in --keyring) kr=$2; shift 2;; --signature-file) sig=$2; shift 2;; *) file=$1; shift;; esac; done' \
             'exec gpgv --keyring "$(readlink -f "$kr")" "$sig" "$file"' | sudo tee /usr/local/bin/sqv >/dev/null
@@ -73,7 +77,12 @@ jobs:
             build=/mnt/buntos-build
           fi
           (while sleep 30; do df --output=avail -BM "$build" | tail -n 1; done >"$RUNNER_TEMP/free.log") &
-          BUNTOS_BUILD_DIR=$build DPKG_FLAGS=-d kernel/tb375fc/build.sh image
+          # 기록은 아티팩트 대신 주석으로도 남긴다 (끝 40줄)
+          set -o pipefail
+          if ! BUNTOS_BUILD_DIR=$build DPKG_FLAGS=-d kernel/tb375fc/build.sh image 2>&1 | tee "$RUNNER_TEMP/kernel.log"; then
+            echo "::error title=커널 빌드 기록 끝::$(grep -vE '^(패치:|  [A-Z]+ )' "$RUNNER_TEMP/kernel.log" | tail -n 40 | sed 's/%/%25/g' | sed -z 's/\n/%0A/g')"
+            exit 1
+          fi
           echo "::notice::커널 빌드 중 가장 적은 빈자리: $(tr -dc '0-9\n' <"$RUNNER_TEMP/free.log" | sort -n | head -n 1)MB"
           mkdir -p ~/kernel-deb
           cp "$build"/tb375fc/deb/*.deb ~/kernel-deb/
@@ -213,7 +222,11 @@ jobs:
         timeout-minutes: 90
         run: |
           df -h "$WORK"
-          BUNTOS_CARGO="$PWD/tools/image/cargo-debian.sh" tools/image/build.sh "$BOARD"
+          set -o pipefail
+          if ! BUNTOS_CARGO="$PWD/tools/image/cargo-debian.sh" tools/image/build.sh "$BOARD" 2>&1 | tee "$RUNNER_TEMP/image.log"; then
+            echo "::error title=이미지 빌드 기록 끝::$(tail -n 40 "$RUNNER_TEMP/image.log" | sed 's/%/%25/g' | sed -z 's/\n/%0A/g')"
+            exit 1
+          fi
           ls -l "$BUNTOS_BUILD_DIR/$BOARD"
           df -h "$WORK"
 
