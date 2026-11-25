@@ -57,8 +57,7 @@ summary() {
 
 	# GPU
 	local renderer
-	renderer=$(journalctl -b --no-pager -o cat -u greetd _COMM=bunt-comp 2>/dev/null | sed -n 's/.*udev: renderer: //p' | tail -1)
-	[ -n "$renderer" ] || renderer=$(journalctl -b --no-pager -o cat 2>/dev/null | sed -n 's/.*bunt_comp::udev: renderer: //p' | tail -1)
+	renderer=$(journalctl -b --no-pager -o cat 2>/dev/null | grep "bunt_comp::udev: renderer: " | tail -1 | sed 's/.*bunt_comp::udev: renderer: //')
 	case "$renderer" in
 		*llvmpipe* | *softpipe* | "") fail GPU "compositor renderer: ${renderer:-unknown}" ;;
 		*) ok GPU "$renderer, $(cat /sys/class/devfreq/*.gpu/cur_freq 2>/dev/null | awk '{print int($1/1000000)}')MHz now" ;;
