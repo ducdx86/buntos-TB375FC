@@ -15,7 +15,7 @@
 //!   같다). 제스처로 잡은 손가락은 받던 앱에서 거둔다(wl_touch.cancel). 꺼낸 막대는 그 막대 밖을 누르거나, 막대를 누른
 //!   손가락을 떼거나, 포인터를 움직일 때까지 둔다(iPadOS의 Dock처럼 손을 떼도 남는다).
 
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 
 use smithay::{
     backend::input::{
@@ -242,6 +242,42 @@ pub struct Touch {
     pen_stroke: Option<(WlSurface, Point<f64, Logical>)>,
     /// 펜이 마지막으로 있던 자리(전역 좌표)
     pen_position: Point<f64, Logical>,
+    /// 펜 필압을 고르게 한다 (PressureFilter)
+    pen_pressure: PressureFilter,
+}
+
+/// 필압 거르개. TB375FC의 펜(NT36532)은 고르게 눌러도 필압이 몇 보고마다 엉뚱한 값(예: 2100 근처에서 40이나 3000)으로
+/// 튄다. 펌웨어 보고의 체크섬은 맞으므로 읽기 오류가 아니다. 그대로 보내면 선이 굵었다 가늘었다 끊어져 보인다. 최근 몇
+/// 값의 중앙값으로 튄 값을 버리고, 반씩 섞어 부드럽게 한다. 240 Hz 보고에서 늦어지는 것은 몇 ms다
+#[derive(Default)]
+struct PressureFilter {
+    recent: VecDeque<f64>,
+    smooth: Option<f64>,
+}
+
+impl PressureFilter {
+    /// 중앙값을 볼 값의 수
+    const WINDOW: usize = 7;
+
+    /// 새 획을 시작한다
+    fn reset(&mut self) {
+        self.recent.clear();
+        self.smooth = None;
+    }
+
+    /// 새 필압 값(0..1)을 넣고 거른 값을 돌려준다
+    fn push(&mut self, pressure: f64) -> f64 {
+        if self.recent.len() == Self::WINDOW {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(pressure);
+        let mut sorted: Vec<f64> = self.recent.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        let median = sorted[sorted.len() / 2];
+        let smooth = self.smooth.map_or(median, |last| (last + median) / 2.0);
+        self.smooth = Some(smooth);
+        smooth
+    }
 }
 
 /// 펜 끝이 떨어진 뒤 이만큼 안에 다시 닿으면 한 번 누른 것으로 본다. 살짝 누를 때 끝이 떨렸다 붙어 한 번 누른 것이
@@ -715,7 +751,7 @@ impl BuntState {
         }
         let serial = SERIAL_COUNTER.next_serial();
         if let Some(focus) = self.touch.pen_stroke.clone() {
-            tool.pressure(pressure);
+            tool.pressure(self.touch.pen_pressure.push(pressure));
             tool.tilt(tilt);
             tool.motion(pos, Some(focus), tablet, serial, time);
             return;
@@ -730,7 +766,8 @@ impl BuntState {
             self.queue_redraw_all();
             self.close_menus_outside(Some(&focus.0));
             self.focus_at(pos, serial);
-            tool.pressure(pressure);
+            self.touch.pen_pressure.reset();
+            tool.pressure(self.touch.pen_pressure.push(pressure));
             tool.tilt(tilt);
             tool.motion(pos, Some(focus.clone()), tablet, serial, time);
             tool.tip_down(serial, time);
@@ -1433,6 +1470,20 @@ mod tests {
         assert!(!palm_rejected(false, Some(1000), 1000 + PALM_GRACE_MS));
         // 장치 시각이 한 바퀴 돌아도 맞게 잰다
         assert!(palm_rejected(false, Some(u32::MAX - 10), 100));
+    }
+
+    #[test]
+    fn pen_pressure_drops_lone_spikes() {
+        let mut filter = PressureFilter::default();
+        // 고르게 누른 0.5 사이에 튄 값이 하나씩 끼어도 걸러진 값은 0.5에 머문다
+        let mut out = Vec::new();
+        for raw in [0.5, 0.5, 0.01, 0.5, 0.75, 0.5, 0.5, 0.01, 0.5, 0.5] {
+            out.push(filter.push(raw));
+        }
+        assert!(out[3..].iter().all(|p| (p - 0.5).abs() < 0.01), "{out:?}");
+        // 새 획은 앞 획의 값을 끌고 오지 않는다
+        filter.reset();
+        assert_eq!(filter.push(0.2), 0.2);
     }
 
     fn slot(id: u32) -> TouchSlot {
