@@ -242,6 +242,8 @@ jobs:
           done
           # LK 부트 이미지(boot/mkimages.sh)는 이미지에 든 것과 같은 커널 꾸러미로 만들어야 모듈이 맞는다
           cp "$BUNTOS_BUILD_DIR"/tb375fc/deb/linux-image-*.deb "$dist/"
+          # 자체 컴포넌트만 바꿀 때 루트를 다시 굽지 않고 기기에서 풀어 넣는다 (tar -C / -xzf)
+          if [[ -d "$src/stage" ]]; then tar -C "$src/stage" -czf "$dist/buntos-components-arm64.tar.gz" .; fi
           (cd "$dist" && sha256sum * >SHA256SUMS && cat SHA256SUMS)
           sha256sum "$src/buntos.root-arm64.raw" | tee -a "$GITHUB_STEP_SUMMARY"
           echo "DIST=$dist" >>"$GITHUB_ENV"
