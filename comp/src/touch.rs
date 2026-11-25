@@ -219,6 +219,18 @@ pub struct Touch {
     pointer_idle: bool,
     /// 열린 팝업 메뉴의 그랩 (state.rs의 XdgShellHandler::grab). 손가락으로 그 밖을 누르면 닫는다
     popup_grab: Option<PopupGrab<BuntState>>,
+    /// 펜이 화면 가까이 있다. 그동안 새 손가락은 손바닥으로 보고 받지 않는다
+    pen_near: bool,
+    /// 펜이 화면에서 멀어진 장치 시각(ms). 그 뒤 PALM_GRACE_MS까지도 손가락을 받지 않는다
+    pen_left_at: Option<u32>,
+}
+
+/// 펜을 뗀 뒤에도 손바닥을 무시하는 시간. 글씨를 쓰다 펜을 잠깐 들어 올린 사이에 닿은 손바닥이 앱에 가지 않게 한다
+const PALM_GRACE_MS: u32 = 500;
+
+/// 손바닥 무시: 펜이 가까이 있거나 막 멀어졌으면 `time`에 닿은 손가락을 받지 않는다
+fn palm_rejected(pen_near: bool, pen_left_at: Option<u32>, time: u32) -> bool {
+    pen_near || pen_left_at.is_some_and(|left| time.wrapping_sub(left) < PALM_GRACE_MS)
 }
 
 impl Touch {
@@ -601,6 +613,14 @@ fn pen_slot() -> TouchSlot {
 
 impl BuntState {
     pub(crate) fn on_touch_down<I: InputBackend>(&mut self, event: I::TouchDownEvent) {
+        // 손바닥 무시. 받지 않은 손가락의 움직임과 떼기는 자리가 없어 저절로 버려진다
+        if palm_rejected(
+            self.touch.pen_near,
+            self.touch.pen_left_at,
+            event.time_msec(),
+        ) {
+            return;
+        }
         if let Some(pos) = self.touch_location::<I, _>(&event) {
             self.touch_down(event.slot(), pos, event.time_msec());
         }
@@ -626,6 +646,7 @@ impl BuntState {
         let time = event.time_msec();
         match event.tip_state() {
             TabletToolTipState::Down => {
+                self.pen_came_near(time);
                 let Some(pos) = self.touch_location::<I, _>(&event) else {
                     return;
                 };
@@ -649,10 +670,40 @@ impl BuntState {
 
     /// 펜이 화면 가까이에서 벗어났다. 끝의 떼기가 빠졌으면 여기서 뗀다
     pub(crate) fn on_pen_proximity<I: InputBackend>(&mut self, event: I::TabletToolProximityEvent) {
-        if event.state() == ProximityState::Out && self.touch.position(pen_slot()).is_some() {
-            self.touch_up(pen_slot(), event.time_msec());
-            self.pen_frame();
+        let time = event.time_msec();
+        match event.state() {
+            ProximityState::In => self.pen_came_near(time),
+            ProximityState::Out => {
+                self.touch.pen_near = false;
+                self.touch.pen_left_at = Some(time);
+                if self.touch.position(pen_slot()).is_some() {
+                    self.touch_up(pen_slot(), time);
+                    self.pen_frame();
+                }
+            }
         }
+    }
+
+    /// 펜이 화면 가까이 왔다. 손바닥은 보통 펜보다 먼저 닿으므로, 이미 닿아 있는 손가락도 거둔다
+    fn pen_came_near(&mut self, time: u32) {
+        if self.touch.pen_near {
+            return;
+        }
+        self.touch.pen_near = true;
+        let palms: Vec<TouchSlot> = self
+            .touch
+            .fingers
+            .iter()
+            .map(|finger| finger.slot)
+            .filter(|slot| *slot != pen_slot())
+            .collect();
+        if palms.is_empty() {
+            return;
+        }
+        for slot in palms {
+            self.touch_cancelled(slot, time);
+        }
+        self.pen_frame();
     }
 
     /// libinput은 펜에 터치 프레임을 보내지 않으므로 이벤트마다 wl_touch.frame을 보낸다
@@ -1187,6 +1238,16 @@ impl BuntState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn palms_are_ignored_while_the_pen_is_near_and_just_after() {
+        assert!(!palm_rejected(false, None, 1000));
+        assert!(palm_rejected(true, None, 1000));
+        assert!(palm_rejected(false, Some(1000), 1000 + PALM_GRACE_MS - 1));
+        assert!(!palm_rejected(false, Some(1000), 1000 + PALM_GRACE_MS));
+        // 장치 시각이 한 바퀴 돌아도 맞게 잰다
+        assert!(palm_rejected(false, Some(u32::MAX - 10), 100));
+    }
 
     fn slot(id: u32) -> TouchSlot {
         TouchSlot::from(Some(id))
