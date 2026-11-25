@@ -1,0 +1,179 @@
+#!/bin/bash
+# SPDX-FileCopyrightText: 2026 buntOS contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# TB375FC self-test. Reads the state of every part of the tablet and prints one line per part,
+# OK / WARN / FAIL, and then the errors of this boot. It only reads: it changes nothing.
+# Run it as root (the USB serial shell is root). The full report goes to /root/selftest-<time>.txt.
+#
+#   bash /usr/libexec/buntos/selftest
+
+export LC_ALL=C
+REPORT=/root/selftest-$(date +%Y%m%d-%H%M%S).txt
+USER_NAME=$(loginctl list-sessions --no-legend 2>/dev/null | awk '$3 != "" && $3 != "root" && $3 != "greeter" {print $3; exit}')
+USER_ID=$(id -u "$USER_NAME" 2>/dev/null)
+as_user() {
+	[ -n "$USER_ID" ] || return 1
+	runuser -u "$USER_NAME" -- env XDG_RUNTIME_DIR=/run/user/$USER_ID \
+		DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$USER_ID/bus "$@"
+}
+
+line() { printf '%-5s %-11s %s\n' "$1" "$2" "$3"; }
+ok() { line OK "$1" "$2"; }
+warn() { line WARN "$1" "$2"; }
+fail() { line FAIL "$1" "$2"; }
+
+summary() {
+	echo "== buntOS selftest $(date '+%F %T') kernel $(uname -r) up $(uptime -p | sed 's/^up //')"
+
+	# CPU
+	local pol txt="" low=0
+	for pol in /sys/devices/system/cpu/cpufreq/policy*; do
+		[ -d "$pol" ] || continue
+		txt+="$(basename "$pol"):$(($(cat "$pol/cpuinfo_max_freq") / 1000))MHz/$(cat "$pol/scaling_governor") "
+	done
+	if [ -n "$txt" ]; then ok CPU "$txt"; else fail CPU "no cpufreq"; fi
+
+	# Temperature
+	local max=0 z t name=""
+	for z in /sys/class/thermal/thermal_zone*; do
+		t=$(cat "$z/temp" 2>/dev/null) || continue
+		[ "$t" -gt "$max" ] 2>/dev/null && { max=$t; name=$(cat "$z/type"); }
+	done
+	if [ "$max" -lt 70000 ]; then ok Thermal "hottest $name $((max / 1000))C"; else warn Thermal "hottest $name $((max / 1000))C"; fi
+
+	# Memory
+	local avail total
+	total=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+	avail=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
+	if [ "$avail" -gt 1000 ]; then ok Memory "${avail}/${total} MB free, swap $(awk '/SwapTotal/ {print int($2/1024)}' /proc/meminfo) MB"
+	else warn Memory "${avail}/${total} MB free"; fi
+
+	# Storage
+	local use
+	use=$(df --output=pcent / | tail -1 | tr -dc 0-9)
+	if [ "$use" -lt 90 ]; then ok Storage "root $(df -h --output=used,size / | tail -1 | xargs) used (${use}%)"
+	else warn Storage "root ${use}% full"; fi
+
+	# GPU
+	local renderer
+	renderer=$(journalctl -b --no-pager -o cat -u greetd _COMM=bunt-comp 2>/dev/null | sed -n 's/.*udev: renderer: //p' | tail -1)
+	[ -n "$renderer" ] || renderer=$(journalctl -b --no-pager -o cat 2>/dev/null | sed -n 's/.*bunt_comp::udev: renderer: //p' | tail -1)
+	case "$renderer" in
+		*llvmpipe* | *softpipe* | "") fail GPU "compositor renderer: ${renderer:-unknown}" ;;
+		*) ok GPU "$renderer, $(cat /sys/class/devfreq/*.gpu/cur_freq 2>/dev/null | awk '{print int($1/1000000)}')MHz now" ;;
+	esac
+
+	# Display
+	local conn modes
+	for conn in /sys/class/drm/card*-DSI-*; do
+		[ -e "$conn/status" ] || continue
+		modes=$(sort -u "$conn/modes" | tr '\n' ' ')
+		ok Display "$(basename "$conn") $(cat "$conn/status"), modes: $modes"
+	done
+	local bl
+	for bl in /sys/class/backlight/*; do
+		[ -e "$bl/brightness" ] && ok Backlight "$(basename "$bl") $(cat "$bl/brightness")/$(cat "$bl/max_brightness")"
+	done
+
+	# Input
+	local devs
+	devs=$(sed -n 's/^N: Name="\(.*\)"/\1/p' /proc/bus/input/devices | tr '\n' ',' | sed 's/,$//')
+	ok Input "$devs"
+	grep -i "^N: Name=.*NT36532" /proc/bus/input/devices | grep -qvi stylus && ok Touch "found" || fail Touch "touchscreen missing"
+	grep -q "Stylus" /proc/bus/input/devices && ok Pen "found" || fail Pen "stylus missing"
+
+	# Wi-Fi
+	local wifi
+	wifi=$(nmcli -t -f DEVICE,TYPE,STATE dev 2>/dev/null | awk -F: '$2=="wifi" {print $1" "$3}')
+	if [ -z "$wifi" ]; then fail Wi-Fi "no Wi-Fi device (cold boot? see notes)"
+	elif [[ "$wifi" == *" connected"* ]]; then ok Wi-Fi "$wifi $(nmcli -t -f ACTIVE,SSID,FREQ,SIGNAL dev wifi 2>/dev/null | awk -F: '$1=="yes" {print $3", signal "$4"%"}')"
+	else warn Wi-Fi "$wifi"; fi
+
+	# Bluetooth
+	local bt
+	bt=$(timeout 5 bluetoothctl show 2>/dev/null | awk '/Powered:/ {print "powered "$2}')
+	if [ -n "$bt" ]; then ok Bluetooth "$bt, $(timeout 5 bluetoothctl devices Connected 2>/dev/null | wc -l) connected"
+	else fail Bluetooth "no controller"; fi
+
+	# Audio
+	local sinks
+	sinks=$(as_user wpctl status 2>/dev/null | sed -n '/Sinks:/,/Sources:/p' | grep -E '[0-9]+\.' | sed 's/[│├└─*]//g; s/  */ /g' | tr '\n' ';')
+	if [ -n "$sinks" ]; then ok Audio "sinks:$sinks"; else fail Audio "no sinks (or no user session)"; fi
+	grep -q . /proc/asound/cards 2>/dev/null && ok "Sound card" "$(sed -n 's/^ *[0-9]* \[\(.*\)\].*/\1/p' /proc/asound/cards | xargs)"
+
+	# Battery and charger
+	local ps bat=""
+	for ps in /sys/class/power_supply/*; do
+		case "$(cat "$ps/type" 2>/dev/null)" in
+			Battery) bat="$(basename "$ps") $(cat "$ps/capacity" 2>/dev/null)% $(cat "$ps/status" 2>/dev/null)"
+				[ -r "$ps/power_now" ] && bat+=" $(awk '{printf "%.2fW", $1/1000000}' "$ps/power_now")"
+				[ -r "$ps/current_now" ] && bat+=" $(awk '{printf "%dmA", $1/1000}' "$ps/current_now")" ;;
+			*) [ -r "$ps/online" ] && ok Charger "$(basename "$ps") online=$(cat "$ps/online")" ;;
+		esac
+	done
+	if [ -n "$bat" ]; then ok Battery "$bat"; else fail Battery "no battery"; fi
+
+	# Sensors (rotation needs an accelerometer)
+	local iio=""
+	for z in /sys/bus/iio/devices/iio:device*; do
+		[ -e "$z/name" ] && iio+="$(cat "$z/name") "
+	done
+	if [[ "$iio" == *accel* ]]; then ok Sensors "$iio"; else warn Sensors "no accelerometer (no auto-rotate): ${iio:-none}"; fi
+
+	# Cameras and video
+	local v vids=""
+	for v in /sys/class/video4linux/video*; do
+		[ -e "$v/name" ] && vids+="$(cat "$v/name"); "
+	done
+	ok Video "${vids:-none}"
+
+	# USB
+	local port
+	for port in /sys/class/typec/port*; do
+		[ -e "$port/data_role" ] && ok USB-C "$(basename "$port") data $(cat "$port/data_role") power $(cat "$port/power_role")"
+	done
+	ls /sys/class/udc 2>/dev/null | grep -q . && ok "USB gadget" "$(ls /sys/class/udc | xargs)"
+	lsusb >/dev/null 2>&1 && ok "USB host" "$(lsusb | wc -l) devices"
+
+	# Sleep
+	local susp
+	susp=$(journalctl -b --no-pager -o cat 2>/dev/null | grep -cE "PM: suspend entry")
+	ok Sleep "mem_sleep: $(cat /sys/power/mem_sleep), suspended $susp times this boot"
+
+	# Services and crashes
+	local failed
+	failed=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | xargs)
+	if [ -z "$failed" ]; then ok Services "none failed"; else fail Services "failed: $failed"; fi
+	local user_failed
+	user_failed=$(as_user systemctl --user --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | xargs)
+	[ -n "$user_failed" ] && fail "User svc" "failed: $user_failed"
+	local crashes
+	crashes=$(journalctl -b --no-pager -o cat 2>/dev/null | grep -E "dumped core|segfault at|Process [0-9]+ \(.*\) of user" | sed -E 's/.*Process [0-9]+ \(([^)]*)\).*/\1/; s/.*\] ([^ ]+)\[[0-9]+\]: segfault.*/\1 segfault/' | sort | uniq -c | sort -rn | head -6 | awk '{c=$1; $1=""; printf "%s(x%d) ", $0, c}')
+	if [ -z "$crashes" ]; then ok Crashes "none this boot"; else fail Crashes "$crashes"; fi
+
+	echo "== kernel errors this boot (most frequent):"
+	dmesg --level=err,crit,alert,emerg 2>/dev/null | sed -E 's/^\[ *[0-9.]+\] //; s/[0-9]+/N/g' | sort | uniq -c | sort -rn | head -8 | cut -c1-150
+	echo "== other errors this boot (most frequent):"
+	journalctl -b -p err --no-pager -o short 2>/dev/null | grep -v " kernel: " | sed -E 's/^.{15} [^ ]+ //; s/\[[0-9]+\]//; s/[0-9]+/N/g' | sort | uniq -c | sort -rn | head -8 | cut -c1-150
+	echo "== full report: $REPORT"
+}
+
+details() {
+	echo; echo "==== details ===="
+	echo "-- systemctl --failed"; systemctl --failed --no-pager
+	echo "-- lsmod"; lsmod
+	echo "-- nmcli"; nmcli dev 2>&1; nmcli radio 2>&1
+	echo "-- rfkill"; rfkill 2>&1
+	echo "-- wpctl"; as_user wpctl status 2>&1
+	echo "-- power_supply"; grep -H . /sys/class/power_supply/*/{type,status,capacity,online,voltage_now,current_now,temp} 2>/dev/null
+	echo "-- devfreq"; grep -H . /sys/class/devfreq/*/{cur_freq,min_freq,max_freq,governor} 2>/dev/null
+	echo "-- input"; cat /proc/bus/input/devices
+	echo "-- compositor log"; journalctl -b --no-pager -o short _COMM=bunt-comp 2>/dev/null | grep -vE "GL Extensions" | tail -80
+	echo "-- coredumps"; coredumpctl list --no-pager 2>&1 | tail -20
+	echo "-- journal errors"; journalctl -b -p warning --no-pager 2>/dev/null | tail -200
+	echo "-- dmesg"; dmesg | tail -300
+}
+
+summary | tee "$REPORT"
+details >>"$REPORT" 2>&1
