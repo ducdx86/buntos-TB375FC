@@ -15,10 +15,12 @@
 //!   같다). 제스처로 잡은 손가락은 받던 앱에서 거둔다(wl_touch.cancel). 꺼낸 막대는 그 막대 밖을 누르거나, 막대를 누른
 //!   손가락을 떼거나, 포인터를 움직일 때까지 둔다(iPadOS의 Dock처럼 손을 떼도 남는다).
 
+use std::time::Duration;
+
 use smithay::{
     backend::input::{
-        AbsolutePositionEvent, Event, InputBackend, ProximityState, TabletToolProximityEvent,
-        TabletToolTipEvent, TabletToolTipState, TouchEvent, TouchSlot,
+        AbsolutePositionEvent, Event, InputBackend, ProximityState, TabletToolEvent,
+        TabletToolProximityEvent, TabletToolTipEvent, TabletToolTipState, TouchEvent, TouchSlot,
     },
     desktop::{PopupGrab, PopupUngrabStrategy, WindowSurfaceType, layer_map_for_output},
     input::{
@@ -29,7 +31,13 @@ use smithay::{
         },
     },
     output::Output,
-    reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
+    reexports::{
+        calloop::{
+            RegistrationToken,
+            timer::{TimeoutAction, Timer},
+        },
+        wayland_server::{Resource, protocol::wl_surface::WlSurface},
+    },
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial, Size, Transform},
     wayland::shell::xdg::ToplevelSurface,
 };
@@ -223,7 +231,18 @@ pub struct Touch {
     pen_near: bool,
     /// 펜이 화면에서 멀어진 장치 시각(ms). 그 뒤 PALM_GRACE_MS까지도 손가락을 받지 않는다
     pen_left_at: Option<u32>,
+    /// libinput이 펜 끝이 닿았다고 한다. 실제로 누르는 것은 필압이 PEN_PRESS를 넘을 때부터다
+    pen_tip: bool,
+    /// 펜 끝이 떨어졌지만 아직 떼지 않았다(PEN_BOUNCE_MS 동안 기다린다). 그 타이머
+    pen_release: Option<RegistrationToken>,
 }
+
+/// 펜 끝이 떨어진 뒤 이만큼 안에 다시 닿으면 한 번 누른 것으로 본다. 살짝 누를 때 끝이 떨렸다 붙어 한 번 누른 것이
+/// 두 번(글자 두 개, 스위치 켜고 끄기)이 되지 않게 한다
+const PEN_BOUNCE_MS: u32 = 80;
+
+/// 누르기로 보는 최소 필압(0..1). 떠 있거나 스치기만 한 펜이 누르기가 되지 않게 한다
+const PEN_PRESS: f64 = 0.03;
 
 /// 펜을 뗀 뒤에도 손바닥을 무시하는 시간. 글씨를 쓰다 펜을 잠깐 들어 올린 사이에 닿은 손바닥이 앱에 가지 않게 한다
 const PALM_GRACE_MS: u32 = 500;
@@ -647,39 +666,86 @@ impl BuntState {
         match event.tip_state() {
             TabletToolTipState::Down => {
                 self.pen_came_near(time);
-                let Some(pos) = self.touch_location::<I, _>(&event) else {
-                    return;
-                };
-                self.touch_down(pen_slot(), pos, time);
+                self.touch.pen_tip = true;
+                let pos = self.touch_location::<I, _>(&event);
+                self.pen_press(pos, event.pressure(), time);
             }
-            TabletToolTipState::Up => self.touch_up(pen_slot(), time),
+            TabletToolTipState::Up => {
+                self.touch.pen_tip = false;
+                self.pen_lifted(time);
+            }
+        }
+    }
+
+    /// 펜이 움직였다. 화면에 눌려 있을 때만 손가락의 움직임으로 보낸다(떠 있는 펜은 아직 아무것도 하지 않는다)
+    pub(crate) fn on_pen_axis<I: InputBackend>(&mut self, event: I::TabletToolAxisEvent) {
+        if !self.touch.pen_tip {
+            return;
+        }
+        let pos = self.touch_location::<I, _>(&event);
+        self.pen_press(pos, event.pressure(), event.time_msec());
+    }
+
+    /// 펜 끝이 닿아 있다: 필압이 충분하면 누르거나(이미 눌렸으면 움직이고), 막 떨어진 것을 기다리던 중이면 이어 간다
+    fn pen_press(&mut self, pos: Option<Point<f64, Logical>>, pressure: f64, time: u32) {
+        let Some(pos) = pos else {
+            return;
+        };
+        if let Some(token) = self.touch.pen_release.take() {
+            // 떨림이었다: 떼지 않고 그대로 이어서 움직인다
+            self.loop_handle.remove(token);
+        }
+        if self.touch.position(pen_slot()).is_some() {
+            self.touch_motion(pen_slot(), pos, time);
+        } else if pressure >= PEN_PRESS {
+            self.touch_down(pen_slot(), pos, time);
+        } else {
+            return;
         }
         self.pen_frame();
     }
 
-    /// 펜이 움직였다. 화면에 닿아 있을 때만 손가락의 움직임으로 보낸다(떠 있는 펜은 아직 아무것도 하지 않는다)
-    pub(crate) fn on_pen_axis<I: InputBackend>(&mut self, event: I::TabletToolAxisEvent) {
-        if self.touch.position(pen_slot()).is_none() {
+    /// 펜 끝이 떨어졌다. 바로 떼지 않고 PEN_BOUNCE_MS를 기다려, 그사이 다시 닿으면 한 번 누른 것으로 이어 간다
+    fn pen_lifted(&mut self, time: u32) {
+        if self.touch.position(pen_slot()).is_none() || self.touch.pen_release.is_some() {
             return;
         }
-        if let Some(pos) = self.touch_location::<I, _>(&event) {
-            self.touch_motion(pen_slot(), pos, event.time_msec());
+        let timer = Timer::from_duration(Duration::from_millis(u64::from(PEN_BOUNCE_MS)));
+        let source = self.loop_handle.insert_source(timer, move |_, _, state| {
+            state.touch.pen_release = None;
+            state.pen_release_now(time);
+            TimeoutAction::Drop
+        });
+        match source {
+            Ok(token) => self.touch.pen_release = Some(token),
+            Err(err) => {
+                tracing::warn!("failed to debounce the pen: {err}");
+                self.pen_release_now(time);
+            }
+        }
+    }
+
+    /// 기다리던 떼기를 지금 한다
+    fn pen_release_now(&mut self, time: u32) {
+        if let Some(token) = self.touch.pen_release.take() {
+            self.loop_handle.remove(token);
+        }
+        if self.touch.position(pen_slot()).is_some() {
+            self.touch_up(pen_slot(), time);
             self.pen_frame();
         }
     }
 
-    /// 펜이 화면 가까이에서 벗어났다. 끝의 떼기가 빠졌으면 여기서 뗀다
+    /// 펜이 화면 가까이에서 벗어났다. 끝의 떼기가 빠졌거나 기다리는 중이면 여기서 뗀다
     pub(crate) fn on_pen_proximity<I: InputBackend>(&mut self, event: I::TabletToolProximityEvent) {
         let time = event.time_msec();
         match event.state() {
             ProximityState::In => self.pen_came_near(time),
             ProximityState::Out => {
                 self.touch.pen_near = false;
+                self.touch.pen_tip = false;
                 self.touch.pen_left_at = Some(time);
-                if self.touch.position(pen_slot()).is_some() {
-                    self.touch_up(pen_slot(), time);
-                    self.pen_frame();
-                }
+                self.pen_release_now(time);
             }
         }
     }
