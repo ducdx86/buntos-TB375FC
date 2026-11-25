@@ -576,9 +576,7 @@ impl WifiPage {
                 nm::Settings::new(),
                 point.name(),
             ),
-            Security::Enterprise => self
-                .context
-                .notify(&self.context.tr.get("wifi-enterprise-unsupported")),
+            Security::Enterprise => self.ask_credentials(&device, &point),
             security => self.ask_password(&device, &point, security),
         }
     }
@@ -631,6 +629,68 @@ impl WifiPage {
         ));
         sheet.present();
         entry.grab_focus();
+    }
+
+    /// 회사·학교 네트워크(802.1X): 사용자 이름과 암호를 묻는다
+    fn ask_credentials(self: &Rc<Self>, device: &Device, point: &AccessPoint) {
+        let tr = &self.context.tr;
+        let mut args = FluentArgs::new();
+        args.set("name", point.name());
+        let sheet = Sheet::new(
+            self.context.window().as_ref(),
+            Some(&badge(ICON, Tint::Blue, BadgeSize::Medium)),
+            &tr.get_with("wifi-enterprise-title", &args),
+            Some(&tr.get(security_label_id(Security::Enterprise))),
+            Some(&tr.get("cancel")),
+            &tr.get("wifi-join"),
+        );
+        let user = sheet.add_entry(&tr.get("wifi-username"), false);
+        let password = sheet.add_entry(&tr.get("wifi-password"), true);
+        let show = gtk::CheckButton::builder()
+            .label(tr.get("wifi-show-password"))
+            .css_classes(["sheet-indent"])
+            .build();
+        show.connect_toggled(glib::clone!(
+            #[weak]
+            password,
+            move |show| password.set_visibility(show.is_active())
+        ));
+        sheet.content.append(&show);
+        sheet.confirm.set_sensitive(false);
+        let update = glib::clone!(
+            #[weak]
+            user,
+            #[weak]
+            password,
+            #[weak(rename_to = confirm)]
+            sheet.confirm,
+            move || confirm
+                .set_sensitive(!user.text().trim().is_empty() && !password.text().is_empty())
+        );
+        let on_user = update.clone();
+        user.connect_changed(move |_| on_user());
+        password.connect_changed(move |_| update());
+        let page = self.clone();
+        let (device, point_path, name) = (device.path.clone(), point.path.clone(), point.name());
+        let window = sheet.window.clone();
+        sheet.confirm.connect_clicked(glib::clone!(
+            #[weak]
+            user,
+            #[weak]
+            password,
+            move |_| {
+                let settings = nm::enterprise_settings(user.text().trim(), &password.text());
+                window.close();
+                page.add_network(
+                    device.clone(),
+                    Some(point_path.clone()),
+                    settings,
+                    name.clone(),
+                );
+            }
+        ));
+        sheet.present();
+        user.grab_focus();
     }
 
     /// 새 연결을 만들어 켠다. 연결하지 못하면 만든 연결을 지운다
