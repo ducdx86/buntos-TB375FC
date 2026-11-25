@@ -819,8 +819,11 @@ impl BuntState {
         if self.is_over_top_layer(pos) {
             return Err("over the shell");
         }
-        if self.space.element_under(pos).is_none() {
+        let Some((window, _)) = self.space.element_under(pos) else {
             return Err("no window");
+        };
+        if scrolls_with_pen(&crate::toplevels::title_and_app_id(window).1) {
+            return Err("browser");
         }
         if self
             .seat
@@ -1458,9 +1461,36 @@ impl BuntState {
     }
 }
 
+/// Browsers take the pen as a mouse, so a drag selects text instead of scrolling. They get the
+/// pen as a finger, as on Android: it scrolls and taps.
+fn scrolls_with_pen(app_id: &str) -> bool {
+    let app_id = app_id.to_ascii_lowercase();
+    [
+        "firefox",
+        "chromium",
+        "chrome",
+        "epiphany",
+        "brave",
+        "librewolf",
+        "vivaldi",
+        "falkon",
+    ]
+    .iter()
+    .any(|name| app_id.contains(name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browsers_scroll_with_the_pen() {
+        assert!(scrolls_with_pen("firefox"));
+        assert!(scrolls_with_pen("org.mozilla.firefox"));
+        assert!(scrolls_with_pen("Chromium-browser"));
+        assert!(!scrolls_with_pen("com.github.xournalpp.xournalpp"));
+        assert!(!scrolls_with_pen("org.kde.krita"));
+    }
 
     #[test]
     fn palms_are_ignored_while_the_pen_is_near_and_just_after() {
