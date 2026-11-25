@@ -765,23 +765,47 @@ impl BuntState {
     /// 펜을 펜으로 받을 표면. 펜을 아는 앱의 창이고, 셸(위층 레이어)이나 잠금, 스크린샷 고르기, 창 끌기, 열린 메뉴가
     /// 펜을 받아야 할 때가 아니어야 한다
     fn pen_target(&self, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
-        if self.session_lock.is_locked()
-            || self.screenshot_area.is_some()
-            || self.is_over_top_layer(pos)
-            || self.space.element_under(pos).is_none()
-            || self
-                .seat
-                .get_touch()
-                .is_some_and(|touch| is_window_grab(&touch))
-            || self
-                .seat
-                .get_pointer()
-                .is_some_and(|pointer| pointer.is_grabbed())
-        {
-            return None;
+        self.pen_target_or_why(pos).ok()
+    }
+
+    /// pen_target과 같고, 펜으로 보내지 않을 때는 그 까닭을 돌려준다(기록용)
+    fn pen_target_or_why(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Result<(WlSurface, Point<f64, Logical>), &'static str> {
+        if self.session_lock.is_locked() {
+            return Err("locked");
         }
-        self.surface_under(pos)
-            .filter(|(surface, _)| crate::tablet::takes_pens(surface))
+        if self.screenshot_area.is_some() {
+            return Err("screenshot");
+        }
+        if self.is_over_top_layer(pos) {
+            return Err("over the shell");
+        }
+        if self.space.element_under(pos).is_none() {
+            return Err("no window");
+        }
+        if self
+            .seat
+            .get_touch()
+            .is_some_and(|touch| is_window_grab(&touch))
+        {
+            return Err("window grab");
+        }
+        if self
+            .seat
+            .get_pointer()
+            .is_some_and(|pointer| pointer.is_grabbed())
+        {
+            return Err("pointer grab");
+        }
+        let Some((surface, origin)) = self.surface_under(pos) else {
+            return Err("no surface");
+        };
+        if !crate::tablet::takes_pens(&surface) {
+            return Err("app without tablet support");
+        }
+        Ok((surface, origin))
     }
 
     /// 펜 끝이 떨어졌다. 바로 떼지 않고 PEN_BOUNCE_MS를 기다려, 그사이 다시 닿으면 한 번 누른 것으로 이어 간다
@@ -829,6 +853,10 @@ impl BuntState {
             ProximityState::In => {
                 self.pen_came_near(time);
                 if let Some(pos) = self.touch_location::<I, _>(&event) {
+                    match self.pen_target_or_why(pos) {
+                        Ok((surface, _)) => tracing::info!("pen near {surface:?}: sent as a pen"),
+                        Err(why) => tracing::info!("pen near {pos:?}: sent as a finger ({why})"),
+                    }
                     self.pen_hover(&pen, pos, time);
                 }
             }
