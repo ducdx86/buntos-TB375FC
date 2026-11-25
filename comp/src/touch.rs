@@ -16,7 +16,10 @@
 //!   손가락을 떼거나, 포인터를 움직일 때까지 둔다(iPadOS의 Dock처럼 손을 떼도 남는다).
 
 use smithay::{
-    backend::input::{AbsolutePositionEvent, Event, InputBackend, TouchEvent, TouchSlot},
+    backend::input::{
+        AbsolutePositionEvent, Event, InputBackend, ProximityState, TabletToolProximityEvent,
+        TabletToolTipEvent, TabletToolTipState, TouchEvent, TouchSlot,
+    },
     desktop::{PopupGrab, PopupUngrabStrategy, WindowSurfaceType, layer_map_for_output},
     input::{
         Seat, SeatHandler,
@@ -589,6 +592,13 @@ fn is_foreign_grab(touch: &TouchHandle<BuntState>) -> bool {
         .unwrap_or(false)
 }
 
+/// 펜이 쓰는 손가락 자리. libinput의 손가락 자리는 작은 수라 겹치지 않는다
+const PEN_SLOT: u32 = 0x7fff_0000;
+
+fn pen_slot() -> TouchSlot {
+    TouchSlot::from(Some(PEN_SLOT))
+}
+
 impl BuntState {
     pub(crate) fn on_touch_down<I: InputBackend>(&mut self, event: I::TouchDownEvent) {
         if let Some(pos) = self.touch_location::<I, _>(&event) {
@@ -608,6 +618,48 @@ impl BuntState {
 
     pub(crate) fn on_touch_cancel<I: InputBackend>(&mut self, event: I::TouchCancelEvent) {
         self.touch_cancelled(event.slot(), event.time_msec());
+    }
+
+    /// 펜 끝이 화면에 닿거나 떨어졌다. 펜은 손가락 하나처럼 쓴다(누르기, 끌기, 스크롤, 화면 키보드). 필압과 기울기를
+    /// 앱에 보내는 것(tablet-v2)은 나중에 한다
+    pub(crate) fn on_pen_tip<I: InputBackend>(&mut self, event: I::TabletToolTipEvent) {
+        let time = event.time_msec();
+        match event.tip_state() {
+            TabletToolTipState::Down => {
+                let Some(pos) = self.touch_location::<I, _>(&event) else {
+                    return;
+                };
+                self.touch_down(pen_slot(), pos, time);
+            }
+            TabletToolTipState::Up => self.touch_up(pen_slot(), time),
+        }
+        self.pen_frame();
+    }
+
+    /// 펜이 움직였다. 화면에 닿아 있을 때만 손가락의 움직임으로 보낸다(떠 있는 펜은 아직 아무것도 하지 않는다)
+    pub(crate) fn on_pen_axis<I: InputBackend>(&mut self, event: I::TabletToolAxisEvent) {
+        if self.touch.position(pen_slot()).is_none() {
+            return;
+        }
+        if let Some(pos) = self.touch_location::<I, _>(&event) {
+            self.touch_motion(pen_slot(), pos, event.time_msec());
+            self.pen_frame();
+        }
+    }
+
+    /// 펜이 화면 가까이에서 벗어났다. 끝의 떼기가 빠졌으면 여기서 뗀다
+    pub(crate) fn on_pen_proximity<I: InputBackend>(&mut self, event: I::TabletToolProximityEvent) {
+        if event.state() == ProximityState::Out && self.touch.position(pen_slot()).is_some() {
+            self.touch_up(pen_slot(), event.time_msec());
+            self.pen_frame();
+        }
+    }
+
+    /// libinput은 펜에 터치 프레임을 보내지 않으므로 이벤트마다 wl_touch.frame을 보낸다
+    fn pen_frame(&mut self) {
+        if let Some(touch) = self.seat.get_touch() {
+            touch.frame(self);
+        }
     }
 
     /// 장치가 한 번에 잰 손가락들의 끝. 그사이 이벤트를 받은 앱에 wl_touch.frame을 보낸다

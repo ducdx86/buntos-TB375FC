@@ -152,6 +152,16 @@ impl BuntState {
                 self.on_touch_cancel::<I>(event)
             }
             InputEvent::TouchFrame { event } => self.on_touch_frame::<I>(event),
+            // 화면에 쓰는 펜. 손가락 하나처럼 쓴다 (touch.rs)
+            InputEvent::TabletToolTip { event } => {
+                self.agent_guard.human.touch_down(now);
+                self.on_pen_tip::<I>(event)
+            }
+            InputEvent::TabletToolAxis { event } => {
+                self.agent_guard.human.pointer(now);
+                self.on_pen_axis::<I>(event)
+            }
+            InputEvent::TabletToolProximity { event } => self.on_pen_proximity::<I>(event),
             // 터치 화면이 붙고 빠지면 seat의 터치를 열고 닫는다. 빠지면 닿아 있던 손가락의 떼기가 오지 않는다
             InputEvent::DeviceAdded { device }
                 if device.has_capability(DeviceCapability::Touch) =>
