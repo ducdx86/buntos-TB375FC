@@ -13,6 +13,7 @@ enable buntos-kedump-clear.service
 enable buntos-display.service
 enable buntos-gpu.service
 enable buntos-wifi.service
+enable buntos-wifi-watchdog.service
 enable buntos-bluetooth.service
 enable buntos-sound.service
 enable buntos-video.service

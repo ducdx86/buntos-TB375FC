@@ -1,0 +1,59 @@
+#!/bin/bash
+# SPDX-FileCopyrightText: 2026 buntOS contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Wi-Fi 지킴이. 칩의 펌웨어가 멈추면 wlan0은 남아 있는데 주위의 AP를 하나도 찾지 못한다(2026-11-25 기기, CPU를
+# 최고 클럭에 묶은 동안). 그때 드라이버를 내렸다 다시 올리면 돌아온다. 저장된 Wi-Fi가 있는데 연결이 끊긴 채로 두 번
+# 이어서 스캔해도 아무것도 없으면 그렇게 한다. 정말 AP가 없는 곳에서 헛되이 되풀이하지 않게 한 시간에 세 번까지만 한다.
+# 블루투스는 같은 칩을 쓰므로 함께 내렸다 올린다.
+set -u
+
+INTERVAL=30
+STRIKES=2
+MAX_PER_HOUR=3
+strikes=0
+reloads=()
+
+log() { echo "wifi-watchdog: $*"; }
+
+reload() {
+	local now=$1 kept=() t
+	for t in "${reloads[@]}"; do
+		[ $((now - t)) -lt 3600 ] && kept+=("$t")
+	done
+	reloads=("${kept[@]}")
+	if [ "${#reloads[@]}" -ge "$MAX_PER_HOUR" ]; then
+		log "Wi-Fi finds no network, but it was reloaded $MAX_PER_HOUR times this hour; leaving it"
+		return
+	fi
+	reloads+=("$now")
+	log "Wi-Fi finds no network while disconnected; reloading the driver"
+	local bt=0
+	systemctl -q is-active buntos-bluetooth.service && bt=1
+	[ "$bt" = 1 ] && systemctl stop buntos-bluetooth.service
+	modprobe -r mt7921soc
+	sleep 3
+	modprobe mt7921soc || log "failed to load the Wi-Fi driver"
+	[ "$bt" = 1 ] && systemctl start buntos-bluetooth.service
+}
+
+while sleep "$INTERVAL"; do
+	state=$(nmcli -t -f DEVICE,TYPE,STATE dev 2>/dev/null | awk -F: '$2 == "wifi" {print $3; exit}')
+	if [ "$state" != disconnected ] ||
+		[ "$(nmcli -t radio wifi 2>/dev/null)" != enabled ] ||
+		! nmcli -t -f TYPE con show 2>/dev/null | grep -q '^802-11-wireless$'; then
+		strikes=0
+		continue
+	fi
+	nmcli dev wifi rescan >/dev/null 2>&1
+	sleep 6
+	if [ "$(nmcli -t -f SSID dev wifi list 2>/dev/null | wc -l)" -gt 0 ]; then
+		strikes=0
+		continue
+	fi
+	strikes=$((strikes + 1))
+	if [ "$strikes" -ge "$STRIKES" ]; then
+		strikes=0
+		reload "$(date +%s)"
+	fi
+done
