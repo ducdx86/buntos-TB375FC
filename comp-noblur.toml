@@ -1,0 +1,106 @@
+# SPDX-FileCopyrightText: 2026 buntOS contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# bunt-comp 기본 설정. /etc/buntos/comp.toml이 있으면 그 파일을 쓴다.
+
+[wallpaper]
+# 위에서 아래로 이어지는 그라데이션. 셸이 그리지 않을 때와 셸이 5초 안에 뜨지 않을 때만 보인다
+top = "#5b7cfa"
+bottom = "#f2a7c3"
+
+[keyboard]
+layout = "us"
+repeat-delay = 400
+repeat-rate = 25
+
+[effects]
+# 셸 유리(메뉴, 제어 센터, Dock, 모든 앱 패널) 뒤를 흐리게 그린다. 셸 표면의 알파가 0.5 이상인 곳만
+blur = false
+
+[cursor]
+theme = "Adwaita"
+size = 24
+
+[input]
+# 입력 모드(포인터 모드, 터치 모드). auto는 붙은 입력 장치로 정한다: 터치스크린이 있고 글자 키가 있는 키보드와
+# 포인터 장치(마우스, 터치패드)가 하나도 없으면 터치 모드, 아니면 포인터 모드다. 터치 모드에서 셸은 누를 영역을
+# 키우고 화면 키보드를 띄운다. "pointer"나 "touch"는 장치와 상관없이 그 모드로 둔다(개발과 시험용. 사람이 고르는
+# 설정은 시스템 설정에 없다)
+mode = "auto"
+
+[gpu]
+# 프레임 바닥(frame_floor.rs): 사람이 화면을 움직이는 동안 초당 프레임이 이 값 아래로 떨어지면 GPU의 최소 클럭을
+# 올리고, 지켜지면 다시 내린다. GPU 드라이버가 클럭을 스스로 조절하고(devfreq) 그 최소 클럭 파일(min_freq)을 이
+# 사용자가 쓸 수 있을 때만 동작한다. 그 파일은 기기 BSP의 udev 규칙이 연다. PC의 GPU에는 해당하지 않는다.
+# 0이면 끈다
+min-fps = 60
+# 프레임 바닥이 올릴 수 있는 가장 높은 GPU 클럭(MHz). 0이면 GPU의 최고 클럭까지. 높은 클럭에서 소리가 나는
+# 기기에서 낮춰 쓴다
+min-fps-max-mhz = 0
+
+[agent]
+# AI 에이전트(bunt agent)와 사람이 함께 쓸 때 사람이 먼저다. 사람이 키, 포인터, 터치를 쓴 뒤 이만큼(ms) 지나기
+# 전에는 AI의 키·글·포인터 입력과 창 활성화를 거절하고 AI에게 다시 해 볼 때를 알린다. 사람이 치는 중에는 다른
+# 앱의 새 창이 키보드를 가져가지 않는다
+yield-ms = 1500
+
+[session]
+# 컴포지터가 뜬 뒤 차례로 실행하며 하나씩 끝날 때까지 기다리는 명령. 금방 끝나는 것만 둔다.
+# 세션 환경을 D-Bus와 systemd 사용자 서비스에 알려, D-Bus로 활성화하는 앱과 포털이
+# 이 화면에 뜨고 같은 언어와 렌더러를 쓰게 한다. bunt-shell보다 먼저 끝나야 한다.
+# GSK_RENDERER는 컴포지터가 CPU로 그릴 때만 cairo로 준다(gpu.rs). 주지 않은 변수는 건너뛴다
+prepare = [
+    [
+        "dbus-update-activation-environment", "--systemd",
+        "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "LANG",
+        "GSK_RENDERER", "XCURSOR_THEME", "XCURSOR_SIZE",
+    ],
+    # 로그아웃 뒤 사용자 서비스가 남는 10초(UserStopDelaySec) 안에 다시 로그인하면 앞 세션의 D-Bus와 포털이
+    # 남는다. 셸(GTK)은 뜨면서 포털을 부르고 답을 25초씩 세 번 기다리므로, 포털이 곧바로 떠야 한다.
+    # 1. 실패 기록(시작 횟수 제한)을 지우고, 남은 포털(xdg-desktop-portal)과 구현(xdg-desktop-portal-gtk)을
+    #    내린다. 앞 세션의 환경으로 뜬 것이다. 기다리는 동안 컴포지터가 멈추므로 5초로 묶는다
+    # 2. 둘을 직접 띄운다(기다리지 않는다). D-Bus가 부를 때 뜨게 두면 안 된다: 포털 구현이 옛 화면과 함께
+    #    죽은 뒤 누가 그것을 다시 부르면 그 시작은 "cannot open display"로 실패하는데, systemd는 이 실패를
+    #    dbus-daemon에 알리지 않아 dbus-daemon이 그 활성화를 120초(service_start_timeout) 동안 쥐고 있고,
+    #    그동안 같은 이름을 부르는 쪽은 새로 띄워 달라고 하지 못한 채 기다린다(TB375FC, 2026-11-17·18:
+    #    셸이 76~84초 뒤에 떴다). 쥐고 있는 활성화는 그 이름을 누가 가져가면 풀리므로, 직접 띄우면 풀린다.
+    #    포털도 같은 까닭으로 직접 띄운다
+    [
+        "sh", "-c",
+        "systemctl --user reset-failed xdg-desktop-portal.service xdg-desktop-portal-gtk.service 2>/dev/null; timeout 5 systemctl --user stop xdg-desktop-portal.service xdg-desktop-portal-gtk.service; exec systemctl --user --no-block start xdg-desktop-portal-gtk.service xdg-desktop-portal.service",
+    ],
+]
+# 세션이 끝날 때(로그아웃 등) 화면(Wayland 소켓)이 사라지기 전에 차례로 실행하며 하나씩 끝날 때까지
+# 기다리는 명령. 금방 끝나는 것만 둔다.
+# 포털을 먼저 내리고 그 구현을 내린다. 그대로 두면 구현이 화면과 함께 죽을 때 남은 포털이 그것을 다시
+# 불러 위의 실패한 활성화가 생긴다. 포털이 먼저 없어야 구현을 다시 부를 쪽이 없다. 컴포지터가 죽어
+# 이 명령이 돌지 못한 때는 다음 세션의 prepare가 푼다
+finish = [
+    [
+        "sh", "-c",
+        "timeout 3 systemctl --user stop xdg-desktop-portal.service; exec timeout 3 systemctl --user stop xdg-desktop-portal-gtk.service",
+    ],
+]
+# 셸(메뉴바, Dock). 창 목록·창 조작 프로토콜(wlr-foreign-toplevel)을 쓸 수 있는
+# 특권 클라이언트로 띄운다. 다른 앱에는 이 프로토콜이 보이지 않는다.
+# 특권 클라이언트(셸, 입력기, 잠금 화면)는 이름만 적으면 세션의 PATH가 아니라 시스템 디렉터리
+# (/usr/local/bin, /usr/bin, /bin)에서만 찾는다. 입력기와 잠금 화면은 PATH도 그 디렉터리로 받는다
+shell = ["bunt-shell"]
+# 입력기(한글 입력). 키보드를 잡고 조합한 글자를 보내는 프로토콜을 이 연결에만 연다.
+# 꺼지면 다시 띄운다. 입력 소스 전환(Ctrl+Space, 한/영 키)은 컴포지터가 받아 D-Bus로 알린다.
+# 세션의 XDG_CURRENT_DESKTOP(buntOS:GNOME)에 GNOME이 있으면 fcitx5는 GNOME 셸로 알고, 입력기 팝업을
+# 보이려면 셸 확장(kimpanel)을 깔라고 알린다. 팝업은 컴포지터가 input-method-v2로 띄우므로 입력기에는
+# buntOS만 준다
+input-method = ["env", "XDG_CURRENT_DESKTOP=buntOS", "fcitx5"]
+# 그 밖에 셸 다음에 실행할 프로그램. 에이전트 데몬은 사용자가 허용한 AI가 있으면 접근성을 켜고
+# 끝난다. Chromium·Electron 앱은 뜰 때만 접근성이 켜졌는지 보므로 앱이 뜨기 전에 켠다
+startup = [["buntd-agent", "--prepare-session"]]
+# Alt+Enter로 여는 터미널
+terminal = ["foot"]
+# 잠금 화면. ⌃⌘Q, 로고 메뉴의 화면 잠금, loginctl lock-session, 잠자기 직전에 컴포지터가 먼저 화면을
+# 가리고 입력을 막은 뒤 이 프로그램을 띄운다. 잠금 프로토콜(ext-session-lock-v1)은 이 연결에만 연다.
+# 잠금은 이 프로그램이 사람이 친 암호를 PAM으로 확인해야만 풀린다. 이 프로그램이 죽어도 화면은 잠긴
+# 채로 남고 컴포지터가 다시 띄운다. 비우면 화면을 잠그지 않는다
+lock = ["bunt-lock"]
+# 셸이 끝나면 컴포지터도 끝낼지. 사용자 세션은 셸이 죽어도 앱 창이 남도록 끝내지 않는다
+exit-with-shell = false
