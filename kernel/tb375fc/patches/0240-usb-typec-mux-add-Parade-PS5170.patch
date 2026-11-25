@@ -1,0 +1,362 @@
+From: buntOS contributors <buntos@users.noreply.github.com>
+Subject: [PATCH] usb: typec: mux: add the Parade PS5170 redriver
+
+The PS5170 sits between the USB 3 and DisplayPort PHYs of the TB375FC and
+its USB-C connector. It is an orientation switch and a mode mux: USB only,
+DisplayPort on four lanes (pin assignments C and E), or DisplayPort on two
+lanes next to USB (D). It also carries AUX and HPD to the connector.
+
+The register values come from the vendor driver of the tablet. There is
+no datasheet, so the init sequence is kept as it is. The chip is powered
+through an enable GPIO while a cable is in.
+
+---
+diff --git a/drivers/usb/typec/mux/Kconfig b/drivers/usb/typec/mux/Kconfig
+index 6dd8f961b..5a2b52e94 100644
+--- a/drivers/usb/typec/mux/Kconfig
++++ b/drivers/usb/typec/mux/Kconfig
+@@ -66,6 +66,14 @@ config TYPEC_MUX_PS883X
+ 	  Say Y or M if your system has a Parade PS883x Type-C retimer chip
+ 	  found on some devices with a Type-C port.
+ 
++config TYPEC_MUX_PS5170
++	tristate "Parade PS5170 USB 3 / DisplayPort redriver and mux"
++	depends on I2C
++	select REGMAP_I2C
++	help
++	  Driver for the Parade PS5170 USB 3 and DisplayPort Alt Mode
++	  redriver and mux, as found on the Lenovo TB375FC tablet.
++
+ config TYPEC_MUX_PTN36502
+ 	tristate "NXP PTN36502 Type-C redriver driver"
+ 	depends on I2C
+diff --git a/drivers/usb/typec/mux/Makefile b/drivers/usb/typec/mux/Makefile
+index b4f599eb5..9ada55931 100644
+--- a/drivers/usb/typec/mux/Makefile
++++ b/drivers/usb/typec/mux/Makefile
+@@ -4,6 +4,7 @@ obj-$(CONFIG_TYPEC_MUX_FSA4480)		+= fsa4480.o
+ obj-$(CONFIG_TYPEC_MUX_GPIO_SBU)	+= gpio-sbu-mux.o
+ obj-$(CONFIG_TYPEC_MUX_PI3USB30532)	+= pi3usb30532.o
+ obj-$(CONFIG_TYPEC_MUX_INTEL_PMC)	+= intel_pmc_mux.o
++obj-$(CONFIG_TYPEC_MUX_PS5170)		+= ps5170.o
+ obj-$(CONFIG_TYPEC_MUX_IT5205)		+= it5205.o
+ obj-$(CONFIG_TYPEC_MUX_NB7VPQ904M)	+= nb7vpq904m.o
+ obj-$(CONFIG_TYPEC_MUX_PS883X)		+= ps883x.o
+diff --git a/drivers/usb/typec/mux/ps5170.c b/drivers/usb/typec/mux/ps5170.c
+new file mode 100644
+index 000000000..ec6668422
+--- /dev/null
++++ b/drivers/usb/typec/mux/ps5170.c
+@@ -0,0 +1,312 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Parade PS5170 USB 3 / DisplayPort Alt Mode redriver and mux.
++ *
++ * The register values come from the vendor driver of the Lenovo TB375FC
++ * (drivers/misc/mediatek/typec/mux/ps5170.c, 6.1). There is no datasheet:
++ * the init values are taken as they are.
++ */
++
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
++#include <linux/usb/typec.h>
++#include <linux/usb/typec_altmode.h>
++#include <linux/usb/typec_dp.h>
++#include <linux/usb/typec_mux.h>
++
++#define PS5170_REG_MODE		0x40
++#define PS5170_MODE_OFF		0x80
++#define PS5170_MODE_USB		0xc0
++#define PS5170_MODE_DP4		0xa0
++#define PS5170_MODE_DP2_USB	0xe0
++#define PS5170_MODE_FLIP	BIT(4)
++
++#define PS5170_REG_RESET	0x9d
++#define PS5170_RESET		0x80
++
++#define PS5170_REG_ID		0x52
++#define PS5170_ID		0x20
++
++#define PS5170_REG_AUX		0xa0
++#define PS5170_AUX_ON		0x00
++#define PS5170_AUX_OFF		0x02
++
++#define PS5170_REG_HPD		0xa1
++#define PS5170_HPD_HIGH		0x04
++#define PS5170_HPD_LOW		0x00
++
++struct ps5170 {
++	struct i2c_client *client;
++	struct regmap *regmap;
++	struct gpio_desc *enable;
++	struct typec_switch_dev *sw;
++	struct typec_mux_dev *mux;
++	struct mutex lock;
++
++	enum typec_orientation orientation;
++	unsigned long mode;
++	bool hpd;
++	bool powered;
++};
++
++/* Written after every power on: auto power down, AUX RX reversed, EQ */
++static const struct reg_sequence ps5170_init_seq[] = {
++	{ PS5170_REG_MODE, PS5170_MODE_OFF },
++	{ 0x9f, 0x02 },
++	{ 0x51, 0x87 }, { 0x50, 0x20 }, { 0x54, 0x11 }, { 0x5d, 0x66 },
++	{ 0x52, 0x20 }, { 0x55, 0x00 }, { 0x56, 0x00 }, { 0x57, 0x00 },
++	{ 0x58, 0x00 }, { 0x59, 0x00 }, { 0x5a, 0x00 }, { 0x5b, 0x00 },
++	{ 0x5e, 0x06 }, { 0x5f, 0x00 }, { 0x60, 0x00 }, { 0x61, 0x03 },
++	{ 0x65, 0x40 }, { 0x66, 0x00 }, { 0x67, 0x03 }, { 0x75, 0x0c },
++	{ 0x77, 0x00 }, { 0x78, 0x7c },
++};
++
++static int ps5170_power_on(struct ps5170 *ps)
++{
++	struct device *dev = &ps->client->dev;
++	unsigned int id;
++	int ret;
++
++	if (ps->powered)
++		return 0;
++
++	gpiod_set_value_cansleep(ps->enable, 1);
++	msleep(20);
++
++	ret = regmap_write(ps->regmap, PS5170_REG_RESET, PS5170_RESET);
++	if (ret)
++		goto err;
++	msleep(20);
++	ret = regmap_write(ps->regmap, PS5170_REG_RESET, 0);
++	if (ret)
++		goto err;
++
++	ret = regmap_multi_reg_write(ps->regmap, ps5170_init_seq,
++				     ARRAY_SIZE(ps5170_init_seq));
++	if (ret)
++		goto err;
++
++	ret = regmap_read(ps->regmap, PS5170_REG_ID, &id);
++	if (ret)
++		goto err;
++	if (id != PS5170_ID)
++		dev_warn(dev, "unexpected value 0x%02x at 0x%02x\n", id,
++			 PS5170_REG_ID);
++
++	ps->powered = true;
++	return 0;
++
++err:
++	gpiod_set_value_cansleep(ps->enable, 0);
++	return dev_err_probe(dev, ret, "failed to power on\n");
++}
++
++static void ps5170_power_off(struct ps5170 *ps)
++{
++	if (!ps->powered)
++		return;
++
++	regmap_write(ps->regmap, PS5170_REG_AUX, PS5170_AUX_OFF);
++	regmap_write(ps->regmap, PS5170_REG_HPD, PS5170_HPD_LOW);
++	regmap_write(ps->regmap, PS5170_REG_MODE, PS5170_MODE_OFF);
++	gpiod_set_value_cansleep(ps->enable, 0);
++	ps->powered = false;
++}
++
++/* Puts the chip in the state of the orientation, the mode and the HPD */
++static int ps5170_apply(struct ps5170 *ps)
++{
++	bool dp = false;
++	u8 mode;
++	int ret;
++
++	if (ps->orientation == TYPEC_ORIENTATION_NONE) {
++		ps5170_power_off(ps);
++		return 0;
++	}
++
++	switch (ps->mode) {
++	case TYPEC_DP_STATE_C:
++	case TYPEC_DP_STATE_E:
++		mode = PS5170_MODE_DP4;
++		dp = true;
++		break;
++	case TYPEC_DP_STATE_D:
++		mode = PS5170_MODE_DP2_USB;
++		dp = true;
++		break;
++	case TYPEC_STATE_SAFE:
++		mode = PS5170_MODE_OFF;
++		break;
++	default:
++		mode = PS5170_MODE_USB;
++		break;
++	}
++	if (mode != PS5170_MODE_OFF &&
++	    ps->orientation == TYPEC_ORIENTATION_REVERSE)
++		mode |= PS5170_MODE_FLIP;
++
++	ret = ps5170_power_on(ps);
++	if (ret)
++		return ret;
++
++	ret = regmap_write(ps->regmap, PS5170_REG_MODE, mode);
++	if (ret)
++		return ret;
++
++	ret = regmap_write(ps->regmap, PS5170_REG_AUX,
++			   dp ? PS5170_AUX_ON : PS5170_AUX_OFF);
++	if (ret)
++		return ret;
++
++	return regmap_write(ps->regmap, PS5170_REG_HPD,
++			    dp && ps->hpd ? PS5170_HPD_HIGH : PS5170_HPD_LOW);
++}
++
++static int ps5170_switch_set(struct typec_switch_dev *sw,
++			     enum typec_orientation orientation)
++{
++	struct ps5170 *ps = typec_switch_get_drvdata(sw);
++
++	guard(mutex)(&ps->lock);
++
++	if (ps->orientation == orientation)
++		return 0;
++
++	ps->orientation = orientation;
++	if (orientation == TYPEC_ORIENTATION_NONE) {
++		ps->mode = TYPEC_STATE_USB;
++		ps->hpd = false;
++	}
++
++	return ps5170_apply(ps);
++}
++
++static int ps5170_mux_set(struct typec_mux_dev *mux,
++			  struct typec_mux_state *state)
++{
++	struct ps5170 *ps = typec_mux_get_drvdata(mux);
++	struct typec_displayport_data *dp = state->data;
++
++	if (state->mode >= TYPEC_STATE_MODAL &&
++	    (!state->alt || state->alt->svid != USB_TYPEC_DP_SID))
++		return -EINVAL;
++
++	guard(mutex)(&ps->lock);
++
++	ps->mode = state->mode;
++	ps->hpd = state->mode >= TYPEC_STATE_MODAL && dp &&
++		  (dp->status & DP_STATUS_HPD_STATE);
++
++	return ps5170_apply(ps);
++}
++
++static const struct regmap_config ps5170_regmap = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = 0xff,
++};
++
++static int ps5170_probe(struct i2c_client *client)
++{
++	struct typec_switch_desc sw_desc = { };
++	struct typec_mux_desc mux_desc = { };
++	struct device *dev = &client->dev;
++	struct ps5170 *ps;
++	int ret;
++
++	ps = devm_kzalloc(dev, sizeof(*ps), GFP_KERNEL);
++	if (!ps)
++		return -ENOMEM;
++
++	ps->client = client;
++	ps->orientation = TYPEC_ORIENTATION_NONE;
++	ps->mode = TYPEC_STATE_USB;
++
++	ret = devm_mutex_init(dev, &ps->lock);
++	if (ret)
++		return ret;
++
++	ret = devm_regulator_get_enable_optional(dev, "vcc");
++	if (ret && ret != -ENODEV)
++		return dev_err_probe(dev, ret, "failed to enable vcc\n");
++
++	ps->enable = devm_gpiod_get(dev, "enable", GPIOD_OUT_LOW);
++	if (IS_ERR(ps->enable))
++		return dev_err_probe(dev, PTR_ERR(ps->enable),
++				     "failed to get the enable GPIO\n");
++
++	ps->regmap = devm_regmap_init_i2c(client, &ps5170_regmap);
++	if (IS_ERR(ps->regmap))
++		return dev_err_probe(dev, PTR_ERR(ps->regmap),
++				     "failed to init regmap\n");
++
++	/* Check that the chip answers, then leave it off until a cable comes */
++	ret = ps5170_power_on(ps);
++	if (ret)
++		return ret;
++	ps5170_power_off(ps);
++
++	sw_desc.drvdata = ps;
++	sw_desc.fwnode = dev_fwnode(dev);
++	sw_desc.set = ps5170_switch_set;
++	ps->sw = typec_switch_register(dev, &sw_desc);
++	if (IS_ERR(ps->sw))
++		return dev_err_probe(dev, PTR_ERR(ps->sw),
++				     "failed to register the switch\n");
++
++	mux_desc.drvdata = ps;
++	mux_desc.fwnode = dev_fwnode(dev);
++	mux_desc.set = ps5170_mux_set;
++	ps->mux = typec_mux_register(dev, &mux_desc);
++	if (IS_ERR(ps->mux)) {
++		typec_switch_unregister(ps->sw);
++		return dev_err_probe(dev, PTR_ERR(ps->mux),
++				     "failed to register the mux\n");
++	}
++
++	i2c_set_clientdata(client, ps);
++	return 0;
++}
++
++static void ps5170_remove(struct i2c_client *client)
++{
++	struct ps5170 *ps = i2c_get_clientdata(client);
++
++	typec_mux_unregister(ps->mux);
++	typec_switch_unregister(ps->sw);
++
++	guard(mutex)(&ps->lock);
++	ps5170_power_off(ps);
++}
++
++static const struct of_device_id ps5170_of_match[] = {
++	{ .compatible = "parade,ps5170" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, ps5170_of_match);
++
++static const struct i2c_device_id ps5170_id[] = {
++	{ "ps5170" },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, ps5170_id);
++
++static struct i2c_driver ps5170_driver = {
++	.driver = {
++		.name = "ps5170",
++		.of_match_table = ps5170_of_match,
++	},
++	.probe = ps5170_probe,
++	.remove = ps5170_remove,
++	.id_table = ps5170_id,
++};
++module_i2c_driver(ps5170_driver);
++
++MODULE_DESCRIPTION("Parade PS5170 USB 3 / DisplayPort redriver and mux");
++MODULE_LICENSE("GPL");
