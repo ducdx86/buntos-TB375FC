@@ -264,7 +264,16 @@ pub fn enterprise_settings(identity: &str, password: &str) -> Settings {
     eap.insert("phase2-auth".to_owned(), "mschapv2".to_variant());
     eap.insert("identity".to_owned(), identity.to_variant());
     eap.insert("password".to_owned(), password.to_variant());
+    // 학교의 오래된 RADIUS 서버는 OpenSSL 3의 기본 보안 수준에서 TLS가 맺어지지 않아, 맞는 암호도 틀린 것처럼 보인다
+    eap.insert(
+        "openssl-ciphers".to_owned(),
+        "DEFAULT@SECLEVEL=0".to_variant(),
+    );
     settings.insert("802-1x".to_owned(), eap);
+    // 큰 학교 네트워크는 인증 뒤 IP를 늦게 준다. 기본 45초가 지나면 연결이 실패해 암호를 다시 묻는다
+    let mut ipv4 = HashMap::new();
+    ipv4.insert("dhcp-timeout".to_owned(), 90i32.to_variant());
+    settings.insert("ipv4".to_owned(), ipv4);
     settings
 }
 
