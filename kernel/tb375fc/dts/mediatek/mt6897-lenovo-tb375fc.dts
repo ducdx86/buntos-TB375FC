@@ -8,6 +8,7 @@
 /dts-v1/;
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/iio/adc/mediatek,mt6363-auxadc.h>
+#include <dt-bindings/input/gpio-keys.h>
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/spmi/spmi.h>
@@ -86,13 +87,15 @@
 	 * &uart3. The tablet has no sensor for the keyboard folded back: the
 	 * keyboard reports that itself, and its driver turns it into
 	 * SW_TABLET_MODE.
-	 * TODO(2c): enable with pio and check both levels with evtest.
+	 * Checked on the device: low while a cover is closed. Only opening
+	 * wakes the tablet: closing a cover over a sleeping tablet woke it,
+	 * and logind ignores the lid for a while after a wakeup, so the
+	 * screen stayed on under the cover.
 	 */
 	gpio-keys {
 		compatible = "gpio-keys";
 		pinctrl-names = "default";
 		pinctrl-0 = <&hall_pins>;
-		status = "disabled";
 
 		switch-lid {
 			label = "Lid";
@@ -101,6 +104,7 @@
 			linux,code = <SW_LID>;
 			debounce-interval = <100>;
 			wakeup-source;
+			wakeup-event-action = <EV_ACT_DEASSERTED>;
 		};
 	};
 
