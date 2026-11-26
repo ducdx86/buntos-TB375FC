@@ -44,10 +44,10 @@ index b4f599eb5..9ada55931 100644
  obj-$(CONFIG_TYPEC_MUX_PS883X)		+= ps883x.o
 diff --git a/drivers/usb/typec/mux/ps5170.c b/drivers/usb/typec/mux/ps5170.c
 new file mode 100644
-index 000000000..ec6668422
+index 000000000..111111111
 --- /dev/null
 +++ b/drivers/usb/typec/mux/ps5170.c
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,329 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Parade PS5170 USB 3 / DisplayPort Alt Mode redriver and mux.
@@ -102,6 +102,7 @@ index 000000000..ec6668422
 +	unsigned long mode;
 +	bool hpd;
 +	bool powered;
++	bool absent;
 +};
 +
 +/* Written after every power on: auto power down, AUX RX reversed, EQ */
@@ -153,7 +154,8 @@ index 000000000..ec6668422
 +
 +err:
 +	gpiod_set_value_cansleep(ps->enable, 0);
-+	return dev_err_probe(dev, ret, "failed to power on\n");
++	dev_err(dev, "failed to power on: %d\n", ret);
++	return ret;
 +}
 +
 +static void ps5170_power_off(struct ps5170 *ps)
@@ -200,6 +202,13 @@ index 000000000..ec6668422
 +	if (mode != PS5170_MODE_OFF &&
 +	    ps->orientation == TYPEC_ORIENTATION_REVERSE)
 +		mode |= PS5170_MODE_FLIP;
++
++	/*
++	 * Without the chip USB 2 still works through the connector, so the
++	 * port must not fail its orientation or mode change because of it.
++	 */
++	if (ps->absent)
++		return 0;
 +
 +	ret = ps5170_power_on(ps);
 +	if (ret)
@@ -296,11 +305,19 @@ index 000000000..ec6668422
 +		return dev_err_probe(dev, PTR_ERR(ps->regmap),
 +				     "failed to init regmap\n");
 +
-+	/* Check that the chip answers, then leave it off until a cable comes */
++	/*
++	 * Check that the chip answers, then leave it off until a cable comes.
++	 * The switch and mux are registered either way: the Type-C port waits
++	 * for them, and USB 2 and charging must not depend on the redriver.
++	 */
 +	ret = ps5170_power_on(ps);
-+	if (ret)
-+		return ret;
-+	ps5170_power_off(ps);
++	if (ret) {
++		dev_warn(dev, "no answer at 0x%02x, the redriver stays off\n",
++			 client->addr);
++		ps->absent = true;
++	} else {
++		ps5170_power_off(ps);
++	}
 +
 +	sw_desc.drvdata = ps;
 +	sw_desc.fwnode = dev_fwnode(dev);

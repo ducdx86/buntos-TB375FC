@@ -59,3 +59,13 @@ DP를 켜기 전에 SMC `MTK_SIP_KERNEL_USB_CONTROL`, op 4(PMIC 저전력 자원
 2. PS5170 드라이버(typec 스위치 + 먹스)와 선택 레지스터.
 3. mtk_dp의 MT6897 데이터, dp_intf, PHY.
 4. mediatek-drm의 두 번째 파이프라인(MT6897 mmsys 경로).
+
+## 7. 기기 결과 (2026-11-26)
+
+시험 장치 트리(`test-kernel/test-stage.dtsi` 8절)와 패치 0240으로 시험했다.
+
+- **USB 호스트가 된다.** TCPM이 이중 역할로 Rd 상대를 만나면 VBUS(MT6375 OTG)를 켜고 데이터 역할을 host로 바꾼다. USB 메모리가 `sd*`로 잡힌다. PS5170이 없어 USB 2(480M)뿐이다. PC를 꽂으면 싱크·device로 남고 충전도 된다.
+- **DP Alt 진입이 된다.** USB-C→HDMI 허브에서 SVID 0xff01, VDO 0x00000c05(UFP_D, 핀 배치 C·D)를 받고 Enter Mode가 성공한다. 화면은 mtk_dp가 없어 아직 나오지 않는다.
+- **PS5170이 I2C에 답하지 않는다(-ENXIO).** `i2c@11b70000`(SCL2·SDA2, GPIO141·142 모드 1)과 GPIO16 high는 맞다. 순정의 `mediatek,vs-voter`(MT6363 0x189a, +1 세트, mask 0x20)를 켜도 같다. 0x08~0x77 전체를 GPIO16 high·low로 읽어도 아무도 답하지 않는다. 벤더 드라이버는 케이블이 있을 때만 칩을 건드린다. 다음 시험은 케이블을 꽂은 채 다시 켜 보는 것이다.
+- 그래서 패치 0240은 칩이 답하지 않아도 스위치와 먹스를 등록한다. 그러지 않으면 TCPC 포트가 스위치를 기다리느라 등록되지 않아 USB-C 전체가 서지 않는다.
+- **주의:** 이 장치 트리로 켜면 Wi-Fi(connsys MCU ROM 0)가 Android를 거친 부팅에서도 뜨지 않은 일이 한 번 있었고, s2idle 소모가 약 2%/h로 늘었다(이전 약 0.3%/h). 원인은 아직 가리지 못했다(USB 호스트 경로가 절전을 막는지, 다른 노드인지).
