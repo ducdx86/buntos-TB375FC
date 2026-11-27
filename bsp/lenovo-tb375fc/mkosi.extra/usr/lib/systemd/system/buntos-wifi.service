@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 buntOS contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# Wi-Fi 드라이버를 로그인 화면을 띄운 뒤에 올린다. NetworkManager가 wlan0을 받는다. multi-user.target 앞이라
+# Wi-Fi 드라이버를 로그인 화면을 띄운 뒤에 올린다(wifi-up: 칩의 ROM이 안 뜨면 세 번까지 다시 올린다). NetworkManager가 wlan0을 받는다. multi-user.target 앞이라
 # 적재에서 멈추면 슬롯의 재시도가 줄어 안드로이드로 돌아갈 길이 남는다(buntos-slot-keep.service)
 [Unit]
 Description=Load the Wi-Fi driver
@@ -10,8 +10,8 @@ After=greetd.service buntos-display.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-TimeoutStartSec=30
-ExecStart=/sbin/modprobe mt7921soc
+TimeoutStartSec=90
+ExecStart=/usr/libexec/buntos/wifi-up
 
 [Install]
 WantedBy=multi-user.target
