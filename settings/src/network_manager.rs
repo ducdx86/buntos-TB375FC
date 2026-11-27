@@ -252,6 +252,31 @@ pub fn security_settings(security: Security, password: &str) -> Settings {
     settings
 }
 
+/// 회사·학교 네트워크(802.1X)의 보안 설정 묶음. 가장 흔한 PEAP + MSCHAPv2로 연결한다(eduroam과 대부분의 학교).
+/// 서버 인증서는 확인하지 않는다(GNOME의 "CA 인증서 없음"과 같다)
+pub fn enterprise_settings(identity: &str, password: &str) -> Settings {
+    let mut settings = Settings::new();
+    let mut security = HashMap::new();
+    security.insert("key-mgmt".to_owned(), "wpa-eap".to_variant());
+    settings.insert("802-11-wireless-security".to_owned(), security);
+    let mut eap = HashMap::new();
+    eap.insert("eap".to_owned(), vec!["peap".to_owned()].to_variant());
+    eap.insert("phase2-auth".to_owned(), "mschapv2".to_variant());
+    eap.insert("identity".to_owned(), identity.to_variant());
+    eap.insert("password".to_owned(), password.to_variant());
+    // 학교의 오래된 RADIUS 서버는 OpenSSL 3의 기본 보안 수준에서 TLS가 맺어지지 않아, 맞는 암호도 틀린 것처럼 보인다
+    eap.insert(
+        "openssl-ciphers".to_owned(),
+        "DEFAULT@SECLEVEL=0".to_variant(),
+    );
+    settings.insert("802-1x".to_owned(), eap);
+    // 큰 학교 네트워크는 인증 뒤 IP를 늦게 준다. 기본 45초가 지나면 연결이 실패해 암호를 다시 묻는다
+    let mut ipv4 = HashMap::new();
+    ipv4.insert("dhcp-timeout".to_owned(), 90i32.to_variant());
+    settings.insert("ipv4".to_owned(), ipv4);
+    settings
+}
+
 /// 숨은 네트워크에 처음 연결할 때의 설정
 pub fn hidden_network_settings(ssid: &str, security: Security, password: &str) -> Settings {
     let mut settings = security_settings(security, password);
@@ -554,6 +579,23 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enterprise_networks_join_with_peap() {
+        let settings = enterprise_settings("student", "secret");
+        assert_eq!(
+            settings["802-11-wireless-security"]["key-mgmt"].str(),
+            Some("wpa-eap")
+        );
+        let eap = &settings["802-1x"];
+        assert_eq!(
+            eap["eap"].get::<Vec<String>>(),
+            Some(vec!["peap".to_owned()])
+        );
+        assert_eq!(eap["phase2-auth"].str(), Some("mschapv2"));
+        assert_eq!(eap["identity"].str(), Some("student"));
+        assert_eq!(eap["password"].str(), Some("secret"));
+    }
 
     #[test]
     fn security_follows_access_point_flags() {

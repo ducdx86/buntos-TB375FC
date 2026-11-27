@@ -5,9 +5,10 @@
 # buntOS 그래픽 세션을 시작한다. 로그인 화면(bunt-greeter)이 암호를 확인하면 greetd가 그 사용자의
 # 세션으로 실행한다. 세션(컴포지터)이 끝나면 로그인 화면이 다시 뜬다.
 
-# 표시 언어. 시스템 설정이 고른 언어를 ~/.config/environment.d/에 적는다 (기본은 한국어)
+# 표시 언어. 시스템 설정이 고른 언어를 ~/.config/environment.d/에 적는다 (없으면 /etc/locale.conf, 그것도 없으면 영어)
 LANG=$(cat "${XDG_CONFIG_HOME:-$HOME/.config}"/environment.d/*.conf 2>/dev/null | sed -n 's/^LANG=//p' | tail -n 1)
-export LANG="${LANG:-ko_KR.UTF-8}"
+[ -n "$LANG" ] || LANG=$(sed -n 's/^LANG=//p' /etc/locale.conf 2>/dev/null | tail -n 1)
+export LANG="${LANG:-en_US.UTF-8}"
 export XDG_SESSION_TYPE=wayland
 # 앞이 우선인 목록. 뒤의 GNOME은 Chromium·Electron 앱이 비밀 저장소로 GNOME 키링을 고르게 한다
 # (모르는 데스크톱이면 평문에 저장한다). 자세한 것은 greeter/src/main.rs의 SESSION_ENV

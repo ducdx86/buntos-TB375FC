@@ -1,0 +1,28 @@
+#!/bin/bash
+# SPDX-FileCopyrightText: 2026 buntOS contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Load the Wi-Fi driver, and retry when the chip's ROM does not come up.
+# On some boots the WF CPU never reports its ROM as ready (18060b10 stays 0, "WF ROM ... want 00001d1e"), the
+# probe fails with -110 and no wlan0 appears. modprobe still returns 0 then. Unloading and loading the driver
+# again usually brings it up (2026-11-26/27 on the device), so try up to three times.
+set -u
+
+TRIES=3
+
+log() { echo "wifi-up: $*"; }
+
+has_wifi() { ls /sys/class/ieee80211/ 2>/dev/null | grep -q .; }
+
+for i in $(seq 1 "$TRIES"); do
+	modprobe mt7921soc || log "modprobe failed (try $i)"
+	for _ in $(seq 1 10); do
+		has_wifi && { log "Wi-Fi is up (try $i)"; exit 0; }
+		sleep 0.5
+	done
+	log "no Wi-Fi device after try $i; reloading the driver"
+	modprobe -r mt7921soc
+	sleep 2
+done
+log "Wi-Fi did not come up after $TRIES tries"
+exit 0

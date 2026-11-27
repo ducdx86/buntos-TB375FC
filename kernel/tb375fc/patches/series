@@ -317,3 +317,6 @@
 
 # 0230 TB375FC pen: the stylus only reports at 120 Hz, so make 120 Hz the default
 0230-drm-panel-novatek-nt36532-prefer-120-Hz-on-the-TB375FC.patch
+
+# 0240 USB-C DisplayPort: the PS5170 redriver, an orientation switch and mode mux
+0240-usb-typec-mux-add-Parade-PS5170.patch

@@ -1,0 +1,265 @@
+# TB375FC(bsp/lenovo-tb375fc)의 전체 이미지를 arm64 러너에서 빌드한다. 자체 컴포넌트(Rust), Mesa·UPower·VA-API
+# 꾸러미와 이미지(mkosi)는 arm64에서만 빌드되므로(tools/image/build.sh의 stage_components) GitHub의 arm64 러너를 쓴다.
+# 커널 .deb(kernel/tb375fc/build.sh image)는 앞 작업(kernel)이 같은 러너 종류에서 빌드해 아티팩트로 넘긴다.
+# 커널 입력(kernel/tb375fc, image/mkosi.conf)이 그대로면 캐시의 꾸러미를 다시 쓴다.
+# 산출물: 루트 파티션(buntos.root-arm64.raw, zstd로 줄임)과 커널·initrd를 릴리스(입력 out_tag)에 올린다.
+# 나머지 순서는 x86-64.yml과 같다: Debian 13 도구 트리, 같은 스냅숏의 Debian 컨테이너에서 cargo.
+name: TB375FC 이미지 (arm64)
+
+on:
+  # tb375fc-ci 브랜치에 올리면 바로 돈다 (workflow_dispatch는 기본 브랜치에 파일이 있어야 쓸 수 있다)
+  push:
+    branches: [tb375fc-ci]
+  workflow_dispatch:
+    inputs:
+      out_tag:
+        description: 이미지를 올릴 릴리스 태그 (비우면 아티팩트로만 올린다)
+        required: false
+        default: image-tb375fc
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tb375fc-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  kernel:
+    name: 커널 꾸러미
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    steps:
+      - name: 저장소 받기
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 캐시 복원 (커널 꾸러미)
+        id: kcache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/kernel-deb
+          key: kernel-deb-${{ hashFiles('kernel/tb375fc/**', 'image/mkosi.conf') }}
+
+      - name: 빌드 도구
+        if: ${{ steps.kcache.outputs.cache-hit != 'true' }}
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q flex bison bc libssl-dev libelf-dev dwarves cpio kmod lz4 device-tree-compiler \
+            debhelper libdw-dev rsync zstd gpgv
+          # debian-config.sh는 debian-archive-keyring.pgp와 새 sqv(--signature-file)를 쓴다. Ubuntu 24.04의 열쇠 묶음
+          # (2023.4)은 forky 스냅숏의 서명 열쇠를 모르므로 Debian의 2025.1을 받아 꺼내고, 옛 문법인 sqv 대신 gpgv로 검사한다
+          keyring_deb=debian-archive-keyring_2025.1_all.deb
+          curl -fsSL -o "$RUNNER_TEMP/$keyring_deb" "https://deb.debian.org/debian/pool/main/d/debian-archive-keyring/$keyring_deb"
+          echo "9ea7778e443144ca490668737a8ab22dd3e748bb99e805e22ec055abeb3c7fac  $RUNNER_TEMP/$keyring_deb" | sha256sum -c
+          dpkg-deb -x "$RUNNER_TEMP/$keyring_deb" "$RUNNER_TEMP/keyring"
+          sudo install -m 0644 "$RUNNER_TEMP/keyring/usr/share/keyrings/debian-archive-keyring.pgp" /usr/share/keyrings/
+          printf '%s\n' '#!/bin/bash' 'set -e; kr= sig= file=' \
+            'while [ $# -gt 0 ]; do case "$1" in --keyring) kr=$2; shift 2;; --signature-file) sig=$2; shift 2;; *) file=$1; shift;; esac; done' \
+            'exec gpgv --keyring "$(readlink -f "$kr")" "$sig" "$file"' | sudo tee /usr/local/bin/sqv >/dev/null
+          sudo chmod +x /usr/local/bin/sqv
+          df -h / /mnt 2>/dev/null || true
+          echo "::notice::커널 빌드 전 빈자리: $(df -h --output=avail / | tail -n 1), /mnt $(df -h --output=avail /mnt 2>/dev/null | tail -n 1)"
+
+      - name: 커널 빌드 (build.sh image)
+        if: ${{ steps.kcache.outputs.cache-hit != 'true' }}
+        timeout-minutes: 220
+        run: |
+          free_gb() { df --output=avail -BG "$1" | tail -n 1 | tr -dc 0-9; }
+          build=$HOME/buntos-build
+          if [[ -d /mnt ]] && (($(free_gb /mnt) > $(free_gb /))); then
+            sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/buntos-build
+            build=/mnt/buntos-build
+          fi
+          (while sleep 30; do df --output=avail -BM "$build" | tail -n 1; done >"$RUNNER_TEMP/free.log") &
+          # 기록은 아티팩트 대신 주석으로도 남긴다 (끝 40줄)
+          set -o pipefail
+          if ! BUNTOS_BUILD_DIR=$build DPKG_FLAGS=-d kernel/tb375fc/build.sh image 2>&1 | tee "$RUNNER_TEMP/kernel.log"; then
+            echo "::error title=커널 빌드 기록 끝::$(grep -vE '^(패치:|  [A-Z]+ )' "$RUNNER_TEMP/kernel.log" | tail -n 40 | sed 's/%/%25/g' | sed -z 's/\n/%0A/g')"
+            exit 1
+          fi
+          echo "::notice::커널 빌드 중 가장 적은 빈자리: $(tr -dc '0-9\n' <"$RUNNER_TEMP/free.log" | sort -n | head -n 1)MB"
+          mkdir -p ~/kernel-deb
+          cp "$build"/tb375fc/deb/*.deb ~/kernel-deb/
+          (cd ~/kernel-deb && sha256sum *.deb | tee SHA256SUMS)
+
+      - name: 캐시 저장 (커널 꾸러미)
+        if: ${{ steps.kcache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/kernel-deb
+          key: ${{ steps.kcache.outputs.cache-primary-key }}
+
+      - name: 꾸러미 넘기기
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kernel-deb
+          path: ~/kernel-deb
+          retention-days: 7
+
+      - name: 실패 기록
+        if: ${{ failure() }}
+        run: |
+          echo "::error::커널 빌드 실패. 빈자리: $(df -h --output=avail / | tail -n 1)"
+          df -h || true
+
+  tb375fc:
+    name: lenovo-tb375fc 이미지
+    needs: kernel
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    env:
+      BOARD: lenovo-tb375fc
+      MKOSI_FORCE_USERNS_FALLBACK: "1"
+      GH_TOKEN: ${{ github.token }}
+      OUT_TAG: ${{ github.event_name == 'push' && 'image-tb375fc' || inputs.out_tag }}
+    steps:
+      - name: 저장소 받기
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 러너 확인
+        run: |
+          echo "러너: $(uname -m), CPU $(nproc)개, 메모리 $(free -h | awk '/^Mem:/ {print $2}'), 커널 $(uname -r)"
+          df -h / /mnt 2>/dev/null || true
+
+      - name: 디스크 비우기
+        # bsp/lenovo-tb375fc/mkosi.conf의 PackageDirectories가 ~/buntos-build를 가리키므로 BUNTOS_BUILD_DIR은 그 자리에 둔다
+        run: |
+          docker image prune --all --force >/dev/null || true
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift \
+            /opt/hostedtoolcache /usr/local/share/boost /usr/lib/jvm /usr/local/julia* || true
+          free_gb() { df --output=avail -BG "$1" | tail -n 1 | tr -dc 0-9; }
+          work=$HOME/buntos
+          if [[ -d /mnt ]] && (($(free_gb /mnt) > $(free_gb /))); then
+            work=/mnt/buntos
+          fi
+          sudo install -d -o "$(id -u)" -g "$(id -g)" "$work" "$work/build"
+          ln -sfn "$work/build" "$HOME/buntos-build"
+          {
+            echo "WORK=$work"
+            echo "BUNTOS_BUILD_DIR=$HOME/buntos-build"
+            echo "CARGO_TARGET_DIR=$work/build/cargo-target"
+            echo "BUNTOS_CARGO_CACHE=$work/cache/cargo-debian"
+            echo "XDG_CACHE_HOME=$work/cache"
+          } >>"$GITHUB_ENV"
+          df -h "$work"
+
+      - name: 사용자 이름공간
+        run: |
+          sudo sysctl --ignore --write kernel.apparmor_restrict_unprivileged_unconfined=0
+          sudo sysctl --ignore --write kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: 커널 꾸러미 받기
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: kernel-deb
+          path: ${{ env.BUNTOS_BUILD_DIR }}/tb375fc/deb
+
+      - name: 커널 꾸러미 확인
+        run: |
+          cd "$BUNTOS_BUILD_DIR/tb375fc/deb" && sha256sum -c SHA256SUMS && rm SHA256SUMS
+          ls -l
+          echo "KERNEL_OK=true" >>"$GITHUB_ENV"
+
+      - name: mkosi
+        run: |
+          mkosi_version=$(sed -n 's/^MKOSI_VERSION=//p' tools/devvm/setup.sh)
+          pipx install "git+https://github.com/systemd/mkosi.git@$mkosi_version"
+          bin=$(pipx environment --value PIPX_BIN_DIR)
+          echo "$bin" >>"$GITHUB_PATH"
+          "$bin/mkosi" --version
+
+      - name: 도구 트리 (Debian 13)
+        timeout-minutes: 30
+        run: |
+          tools/image/tools-tree.sh "$WORK/tools"
+          echo "BUNTOS_TOOLS_TREE=$WORK/tools" >>"$GITHUB_ENV"
+
+      - name: Mesa·UPower·VA-API 꾸러미
+        timeout-minutes: 90
+        run: |
+          bsp/lenovo-tb375fc/mesa/build.sh
+          bsp/lenovo-tb375fc/upower/build.sh
+          bsp/lenovo-tb375fc/vaapi/build.sh
+          ls -l "$HOME"/buntos-build/tb375fc/{mesa,upower,vaapi}-deb
+          df -h "$WORK"
+
+      - name: 캐시 복원 (cargo)
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.BUNTOS_CARGO_CACHE }}
+            ${{ env.CARGO_TARGET_DIR }}
+          key: cargo-arm64-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'image/mkosi.conf') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-arm64-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'image/mkosi.conf') }}-
+            cargo-arm64-
+
+      - name: 자체 컴포넌트 빌드
+        id: components
+        timeout-minutes: 60
+        run: tools/image/cargo-debian.sh build --release --locked --workspace
+
+      - name: 캐시 저장 (cargo)
+        if: ${{ !cancelled() && steps.components.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.BUNTOS_CARGO_CACHE }}
+            ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+      - name: 이미지 빌드
+        if: ${{ env.KERNEL_OK == 'true' }}
+        timeout-minutes: 90
+        run: |
+          df -h "$WORK"
+          set -o pipefail
+          if ! BUNTOS_CARGO="$PWD/tools/image/cargo-debian.sh" tools/image/build.sh "$BOARD" 2>&1 | tee "$RUNNER_TEMP/image.log"; then
+            echo "::error title=이미지 빌드 기록 끝::$(tail -n 40 "$RUNNER_TEMP/image.log" | sed 's/%/%25/g' | sed -z 's/\n/%0A/g')"
+            exit 1
+          fi
+          ls -l "$BUNTOS_BUILD_DIR/$BOARD"
+          df -h "$WORK"
+
+      - name: 산출물 모으기
+        if: ${{ env.KERNEL_OK == 'true' }}
+        run: |
+          src=$BUNTOS_BUILD_DIR/$BOARD
+          dist=$WORK/dist
+          mkdir -p "$dist"
+          zstd -T0 -10 -o "$dist/buntos.root-arm64.raw.zst" "$src/buntos.root-arm64.raw"
+          for f in "$src"/buntos.vmlinuz "$src"/buntos.initrd "$src"/buntos.manifest; do
+            if [[ -f "$f" ]]; then cp "$f" "$dist/"; fi
+          done
+          # LK 부트 이미지(boot/mkimages.sh)는 이미지에 든 것과 같은 커널 꾸러미로 만들어야 모듈이 맞는다
+          cp "$BUNTOS_BUILD_DIR"/tb375fc/deb/linux-image-*.deb "$dist/"
+          # 자체 컴포넌트만 바꿀 때 루트를 다시 굽지 않고 기기에서 풀어 넣는다 (tar -C / -xzf)
+          if [[ -d "$src/stage" ]]; then tar -C "$src/stage" -czf "$dist/buntos-components-arm64.tar.gz" .; fi
+          (cd "$dist" && sha256sum * >SHA256SUMS && cat SHA256SUMS)
+          sha256sum "$src/buntos.root-arm64.raw" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "DIST=$dist" >>"$GITHUB_ENV"
+
+      - name: 릴리스에 올리기
+        if: ${{ env.KERNEL_OK == 'true' && env.OUT_TAG != '' }}
+        run: |
+          tag="$OUT_TAG"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease --title "TB375FC 이미지 ($tag)" \
+              --notes "workflow tb375fc.yml, commit $GITHUB_SHA"
+          fi
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber "$DIST"/*
+
+      - name: 실패 기록
+        if: ${{ failure() }}
+        run: |
+          df -h "$WORK" || true
+          du -sh "$WORK"/* 2>/dev/null || true

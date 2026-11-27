@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 buntOS contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# 멈춘 Wi-Fi 칩을 드라이버를 다시 올려 살린다(wifi-watchdog)
+[Unit]
+Description=Reload the Wi-Fi driver when the chip stops finding networks
+After=buntos-wifi.service NetworkManager.service
+Wants=buntos-wifi.service
+
+[Service]
+ExecStart=/usr/libexec/buntos/wifi-watchdog
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

@@ -510,3 +510,80 @@
 &vdec {
 	status = "okay";
 };
+
+// 8절 USB 호스트와 DP Alt 준비(2026-11-25). 사용자 공간의 regulator-output 대신 TCPM이 이중 역할로 VBUS를 낸다:
+// 상대가 Rd(싱크)를 보일 때만, VBUS가 0V인 것을 본 뒤에 OTG 부스트를 켠다. 충전기·PC(Rp)를 만나면 싱크로 남는다.
+// 소스 PDO는 5V 0.9A로 둔다(기본 USB Rp). 순정의 DP Alt 핀 배치는 C·D·E다.
+&mt6375_tcpc {
+	connector {
+		power-role = "dual";
+		data-role = "dual";
+		try-power-role = "sink";
+		source-pdos = <PDO_FIXED(5000, 900, PDO_FIXED_USB_COMM | PDO_FIXED_DUAL_ROLE | PDO_FIXED_DATA_SWAP)>;
+		sink-pdos = <PDO_FIXED(5000, 3000, PDO_FIXED_USB_COMM | PDO_FIXED_DUAL_ROLE | PDO_FIXED_DATA_SWAP)
+			     PDO_FIXED(9000, 2000, 0)>;
+
+		altmodes {
+			displayport {
+				svid = /bits/ 16 <0xff01>;
+				/* DFP_D, DP 1.3 신호, 리셉터클, 핀 배치 C·D·E */
+				vdo = <0x00001c46>;
+			};
+		};
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				typec_hs: endpoint {
+					remote-endpoint = <&usb_role_sw>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+				typec_ss: endpoint {
+					remote-endpoint = <&ps5170_in>;
+				};
+			};
+		};
+	};
+};
+
+&ssusb {
+	dr_mode = "otg";
+	usb-role-switch;
+	role-switch-default-mode = "peripheral";
+
+	port {
+		usb_role_sw: endpoint {
+			remote-endpoint = <&typec_hs>;
+		};
+	};
+};
+
+&xhci0 {
+	status = "okay";
+};
+
+// PS5170 리드라이버(패치 0240). GPIO16이 칩을 켠다(순정 핀 상태 enable/disable)
+&i2c2 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	ps5170@28 {
+		compatible = "parade,ps5170";
+		reg = <0x28>;
+		enable-gpios = <&pio 16 GPIO_ACTIVE_HIGH>;
+		orientation-switch;
+		mode-switch;
+
+		port {
+			ps5170_in: endpoint {
+				remote-endpoint = <&typec_ss>;
+			};
+		};
+	};
+};

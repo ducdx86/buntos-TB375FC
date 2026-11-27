@@ -13,7 +13,7 @@ use std::{
     },
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Instant,
 };
@@ -97,7 +97,7 @@ use smithay::{
         },
         shm::{ShmHandler, ShmState},
         socket::ListeningSocketSource,
-        tablet_manager::TabletSeatHandler,
+        tablet_manager::TabletManagerState,
         text_input::TextInputManagerState,
         viewporter::ViewporterState,
         virtual_keyboard::VirtualKeyboardManagerState,
@@ -271,6 +271,8 @@ impl BuntState {
         // 앱이 커서 이미지를 직접 그리지 않고 모양(글자 입력, 손가락 등)만 알린다. 모든 앱의 커서가
         // 시스템 설정에서 고른 크기로 같게 보이고, 컴포지터가 그린 커서는 커서 평면에 오른다
         CursorShapeManagerState::new::<Self>(&dh);
+        // 펜을 아는 앱에 펜을 펜으로 보낸다(필압, 기울기). 펜을 모르는 앱에는 손가락처럼 보낸다 (tablet.rs, touch.rs)
+        TabletManagerState::new::<Self>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
@@ -1358,6 +1360,8 @@ pub struct ClientState {
     /// 컴포지터가 띄운 프로그램(spawn_trusted)의 pid. 모르면 0. 미리 만든 연결(socketpair)은 SO_PEERCRED가
     /// 그 쌍을 만든 컴포지터 자신이라, 셸의 표면이 컴포지터의 pid로 알려졌다 (surface_pid)
     pub spawned_pid: AtomicU32,
+    /// 태블릿 자리(zwp_tablet_seat_v2)를 받았다. 펜을 펜으로 보낸다 (tablet.rs)
+    pub tablet: AtomicBool,
 }
 
 fn is_input_method_client(client: &Client) -> bool {
@@ -2409,7 +2413,6 @@ delegate_xdg_shell!(BuntState);
 impl XdgDialogHandler for BuntState {}
 delegate_xdg_dialog!(BuntState);
 
-impl TabletSeatHandler for BuntState {}
 delegate_cursor_shape!(BuntState);
 // 레이어 셸은 smithay의 처리에 맡기고, 레이어 표면 객체가 없어질 때만 손본다
 delegate_dispatch!(BuntState: [ZwlrLayerShellV1: ()] => WlrLayerShellState);

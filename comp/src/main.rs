@@ -33,6 +33,7 @@ mod screenshot;
 mod shmdiff;
 mod shortcuts;
 mod state;
+mod tablet;
 #[cfg(test)]
 mod testing;
 mod texture_shader;

@@ -23,11 +23,14 @@
 //! | 터치스크린. 포인터 기능을 함께 알려도 포인터 장치로 세지 않는다 | 터치스크린 |
 //! | 펜 디지타이저, 펜 태블릿의 단추판 | 빼다 (아래 1) |
 //! | uinput 가상 장치: keyd, kmonad, input-remapper, ydotool, Steam 입력 | 빼다 (아래 2) |
+//! | 펜의 단추를 마우스로 알리는 Bluetooth 펜(Lenovo Tab Pen Plus Mouse) | 빼다 (아래 3) |
 //!
 //! 1. 화면에 바로 쓰는 펜은 iPad의 Apple Pencil처럼 모드를 바꾸지 않는다. 펜을 쓰는 태블릿은 펜이 없어도
 //!    디지타이저가 늘 붙어 있어, 세면 터치 모드가 되지 못한다
 //! 2. 하드웨어가 아니다. 키를 바꾸는 도구는 진짜 키보드를 뗀 뒤에도 가상 키보드를 남겨, 세면 터치 모드가 되지
 //!    못한다
+//! 3. 발표용 단추를 마우스 단추로 보내는 Bluetooth 펜이다. 펜을 짝지으면 늘 붙어 있어, 세면 터치 모드가 되지 못하고
+//!    화면 키보드가 뜨지 않는다. 이름에 낱말 "pen"이 든 포인터 장치를 이것으로 본다
 
 use std::{ffi::OsStr, fmt, ops::RangeInclusive, path::Path};
 
@@ -121,6 +124,8 @@ pub struct DeviceTraits {
     pub touch: bool,
     /// uinput이 만든 가상 장치
     pub uinput: bool,
+    /// 이름에 낱말 "pen"이 든 장치: 단추를 마우스로 알리는 Bluetooth 펜 (머리말의 3)
+    pub pen: bool,
 }
 
 impl DeviceTraits {
@@ -137,6 +142,7 @@ impl DeviceTraits {
             pointer: device.has_capability(DeviceCapability::Pointer),
             touch: device.has_capability(DeviceCapability::Touch),
             uinput: is_uinput(device),
+            pen: names_a_pen(device.name()),
         }
     }
 }
@@ -144,6 +150,12 @@ impl DeviceTraits {
 fn is_uinput(device: &InputDevice) -> bool {
     // 안전: udev 장치는 libinput 장치(device)가 사는 동안 쓴다 (udev.rs의 device_info와 같다)
     unsafe { device.udev_device() }.is_some_and(|udev| is_uinput_path(udev.devpath()))
+}
+
+/// 장치 이름에 낱말 "pen"이 있는지 (대소문자 무시). "Open"이나 "Pentax"처럼 다른 낱말 안의 pen은 아니다
+fn names_a_pen(name: &str) -> bool {
+    name.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| word.eq_ignore_ascii_case("pen"))
 }
 
 /// 장치 노드(eventN)의 sysfs 경로(devpath)가 uinput 장치의 것인지
@@ -169,7 +181,7 @@ impl Role {
         }
         Self {
             keyboard: traits.keyboard && traits.letters,
-            pointer: traits.pointer && !traits.touch,
+            pointer: traits.pointer && !traits.touch && !traits.pen,
             touchscreen: traits.touch,
         }
     }
@@ -392,6 +404,7 @@ mod tests {
         pointer: false,
         touch: false,
         uinput: false,
+        pen: false,
     };
     const MOUSE: DeviceTraits = DeviceTraits {
         keyboard: false,
@@ -399,6 +412,7 @@ mod tests {
         pointer: true,
         touch: false,
         uinput: false,
+        pen: false,
     };
     const TOUCHSCREEN: DeviceTraits = DeviceTraits {
         keyboard: false,
@@ -406,6 +420,7 @@ mod tests {
         pointer: false,
         touch: true,
         uinput: false,
+        pen: false,
     };
 
     fn role(keyboard: bool, pointer: bool, touchscreen: bool) -> Role {
@@ -483,6 +498,11 @@ mod tests {
                 Role::default(),
             ),
             (
+                "Bluetooth pen whose buttons are a mouse",
+                DeviceTraits { pen: true, ..MOUSE },
+                Role::default(),
+            ),
+            (
                 "ydotool's virtual mouse",
                 DeviceTraits {
                     uinput: true,
@@ -494,6 +514,15 @@ mod tests {
         for (name, traits, expected) in cases {
             assert_eq!(Role::of(traits), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn pens_are_named_by_the_word_pen() {
+        assert!(names_a_pen("Lenovo Tab Pen Plus Mouse"));
+        assert!(names_a_pen("S-Pen remote"));
+        assert!(!names_a_pen("Logitech Open Mouse"));
+        assert!(!names_a_pen("Pentax mouse"));
+        assert!(!names_a_pen("USB Optical Mouse"));
     }
 
     #[test]

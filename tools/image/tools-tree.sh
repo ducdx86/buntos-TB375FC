@@ -27,6 +27,8 @@ packages=(
 	systemd udev systemd-container systemd-repart systemd-ukify systemd-boot-tools systemd-boot-efi
 	debian-archive-keyring ca-certificates dosfstools mtools e2fsprogs btrfs-progs erofs-utils squashfs-tools
 	cpio zstd xz-utils kmod python3 python3-pefile qemu-utils
+	# mkosi가 PackageDirectories=(bsp/lenovo-tb375fc)의 꾸러미로 지역 저장소를 만들 때 apt-ftparchive를 부른다
+	apt-utils
 )
 # 이미지를 띄울 QEMU와 UEFI 펌웨어는 이 컴퓨터와 같은 아키텍처만 넣는다 (KVM으로 띄운다)
 case "$(uname -m)" in
